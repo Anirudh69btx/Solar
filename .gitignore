@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+
+# Firebase secrets
+serviceAccountKey.json
+*.json
+
+# Environment secrets
+.env
+.env.*
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

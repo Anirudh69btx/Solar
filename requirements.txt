@@ -1,0 +1,30 @@
+# Firebase & Database
+firebase-admin==6.5.0
+google-cloud-firestore==2.19.0
+
+# Data Manipulation & Analysis
+pandas==2.2.2
+numpy==1.26.4
+
+# Plotting & Visualization
+matplotlib==3.9.0
+plotly==5.22.0
+
+# Web Framework (for backend API - optional but useful)
+flask==3.0.3
+flask-cors==4.0.1
+
+# For making HTTP requests (if needed)
+requests==2.32.3
+
+# Real-time data streaming (optional)
+websockets==12.0
+
+# For chatbot/AI features (optional)
+openai==1.35.0
+
+# Utilities
+python-dotenv==1.0.1
+python-dateutil==2.9.0
+scikit-learn==1.5.1
+seaborn==0.13.2
