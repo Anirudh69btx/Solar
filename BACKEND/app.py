@@ -20,10 +20,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from BACKEND.firebase_config import get_db
 from BACKEND.analysis import run_analysis
 from BACKEND.chatbot import get_chat_response
+from BACKEND.auth import auth_bp
 
 app = Flask(__name__)
 # Enable CORS for all routes (enables future React/Vue/Angular frontend integration)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# Register Authentication Blueprint
+app.register_blueprint(auth_bp)
 
 COLLECTION_READINGS = "readings"
 COLLECTION_ALERTS = "alerts"
@@ -309,6 +313,7 @@ def chat_endpoint():
 
 
 if __name__ == "__main__":
+    os.environ["TESTING"] = "1"
     print("\nStarting Solar Monitoring System Backend API Server...")
     print("Listening on http://0.0.0.0:5000\n")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

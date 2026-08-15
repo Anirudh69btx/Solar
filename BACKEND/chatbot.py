@@ -102,6 +102,7 @@ def _get_readings_between(db, start_ts: int, end_ts: int) -> List[Dict]:
         readings_ref = db.collection(COLLECTION_READINGS)
         query = (
             readings_ref
+            .select(["unix_timestamp", "expected_power", "power", "performance_ratio", "timestamp"])
             .where(filter=FieldFilter("unix_timestamp", ">=", start_ts))
             .where(filter=FieldFilter("unix_timestamp", "<=", end_ts))
             .order_by("unix_timestamp", direction="ASCENDING")
