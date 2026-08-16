@@ -6,7 +6,7 @@ Features:
 - ID token verification & decoding (auth.verify_id_token)
 - Authentication decorator (@require_auth)
 - Role-based authorization decorator (@require_role('owner', 'technician', 'admin'))
-- Public Registration (POST /api/auth/register - default & enforced role: owner)
+- Public Registration (POST /api/auth/register - strictly owner role only)
 - Admin User Creation (POST /api/auth/users - restricted to admin role)
 - User Profile Endpoint (GET /api/auth/me)
 """
@@ -31,16 +31,10 @@ auth_bp = Blueprint("auth", __name__)
 COLLECTION_USERS = "users"
 VALID_ROLES = ["owner", "technician", "admin"]
 
-# Environment-controlled flag for testing environments (Disabled by default in production)
-ALLOW_TEST_TOKENS = os.environ.get("TESTING", "0").lower() in ("1", "true", "yes")
-
 
 def verify_token(id_token: str) -> dict:
     """
-    Verifies a Firebase ID token string.
-
-    In production, this strictly calls firebase_admin.auth.verify_id_token(id_token).
-    Test tokens are only evaluated if TESTING environment variable is explicitly set.
+    Verifies a Firebase ID token string using Firebase Admin SDK.
 
     Args:
         id_token (str): Raw Firebase JWT ID token string.
@@ -49,22 +43,17 @@ def verify_token(id_token: str) -> dict:
         dict: Decoded token claims containing uid, email, etc.
 
     Raises:
-        ValueError, auth.InvalidIdTokenError, auth.ExpiredIdTokenError: On invalid token.
+        ValueError: If id_token is empty or not a string.
+        auth.InvalidIdTokenError: If token is invalid or malformed.
+        auth.ExpiredIdTokenError: If token has expired.
+        auth.RevokedIdTokenError: If token was revoked.
+        auth.CertificateFetchError: If public certs cannot be fetched.
+        Exception: On other verification failures.
     """
-    if not id_token:
-        raise ValueError("ID token string is empty.")
+    if not id_token or not isinstance(id_token, str):
+        raise ValueError("ID token string is empty or invalid.")
 
-    # Evaluate test token authorization dynamically at runtime
-    allow_test_tokens = (
-        os.environ.get("TESTING", "0").lower() in ("1", "true", "yes") or
-        os.environ.get("FLASK_ENV") == "testing"
-    )
-
-    if allow_test_tokens and (id_token.startswith("test-token-") or id_token.startswith("mock-token-")):
-        uid = id_token.replace("test-token-", "").replace("mock-token-", "")
-        return {"uid": uid, "email": f"{uid}@solar.com"}
-
-    # Production verification using Firebase Admin SDK
+    # Production verification: strictly call Firebase Admin SDK
     decoded_token = auth.verify_id_token(id_token)
     return decoded_token
 
@@ -72,7 +61,7 @@ def verify_token(id_token: str) -> dict:
 def require_auth(f):
     """
     Decorator requiring a valid Firebase Bearer token in the Authorization header.
-    Attaches the decoded user profile dictionary to Flask's `g.user` and `request.user`.
+    Attaches the Firestore user profile dictionary to Flask's `g.user` and `request.user`.
     """
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -83,7 +72,7 @@ def require_auth(f):
                 "message": "Missing or malformed Authorization header. Expected format: 'Bearer <token>'"
             }), 401
 
-        token = auth_header.split("Bearer ")[1].strip()
+        token = auth_header.split("Bearer ", 1)[1].strip()
         if not token:
             return jsonify({
                 "error": "Unauthorized",
@@ -187,8 +176,15 @@ def require_role(*allowed_roles):
 def register_user():
     """
     Public user registration endpoint.
-    Payload: {email, password, name}
-    SECURITY RULE: Public signup forcedly sets role = 'owner'. Client-supplied role is ignored.
+    Payload: {email, password, name, [role]}
+
+    SECURITY POLICIES:
+    1. Public registration is strictly allowed ONLY for the 'owner' role.
+    2. If a client attempts to supply a privileged role (e.g. 'admin' or 'technician'),
+       the request is rejected with HTTP 403 Forbidden.
+    3. If role is omitted or empty, it defaults to 'owner'.
+    4. Duplicate emails return HTTP 409 Conflict without overwriting existing profiles.
+    5. Firestore profile creation is tied to successful real Firebase Auth UID.
     """
     try:
         data = request.get_json(silent=True)
@@ -199,7 +195,19 @@ def register_user():
         password = data.get("password", "").strip()
         name = data.get("name", "").strip()
 
-        # Enforce public signup role as 'owner'
+        # Prevent privilege escalation: public registration is restricted to 'owner'
+        requested_role = data.get("role")
+        if requested_role is not None:
+            requested_role_str = str(requested_role).strip().lower()
+            if requested_role_str != "" and requested_role_str != "owner":
+                logger.warning(
+                    f"Rejected public self-registration attempt with role '{requested_role}' for email '{email}'"
+                )
+                return jsonify({
+                    "error": "Forbidden",
+                    "message": "Public registration is allowed only for the owner role."
+                }), 403
+
         role = "owner"
 
         if not email or not password:
@@ -208,7 +216,7 @@ def register_user():
         if len(password) < 6:
             return jsonify({"error": "Password must be at least 6 characters long"}), 400
 
-        # Check Firestore first for existing email to prevent duplicate accounts
+        # Check Firestore for existing email to prevent duplicates
         db = get_db()
         if db is None:
             logger.error("Database handle unavailable in register_user")
@@ -216,7 +224,11 @@ def register_user():
 
         existing_users = list(db.collection(COLLECTION_USERS).where("email", "==", email).limit(1).stream())
         if existing_users:
-            return jsonify({"error": f"A user with email '{email}' already exists."}), 409
+            logger.warning(f"Registration conflict: email '{email}' already exists in Firestore.")
+            return jsonify({
+                "error": "Conflict",
+                "message": "A user with this email already exists."
+            }), 409
 
         # Create user in Firebase Authentication
         try:
@@ -227,15 +239,19 @@ def register_user():
             )
             uid = user_record.uid
         except auth.EmailAlreadyExistsError:
-            return jsonify({"error": f"A user with email '{email}' already exists in Firebase Auth."}), 409
+            logger.warning(f"Registration conflict: email '{email}' already exists in Firebase Auth.")
+            return jsonify({
+                "error": "Conflict",
+                "message": "A user with this email already exists."
+            }), 409
         except Exception as auth_err:
-            logger.error(f"Firebase Auth creation failed: {auth_err}")
+            logger.error(f"Firebase Auth user creation failed for '{email}': {auth_err}")
             return jsonify({
                 "error": "Registration failed",
-                "details": str(auth_err)
+                "message": f"Failed to create user in Firebase Auth: {str(auth_err)}"
             }), 400
 
-        # Create user document in Firestore 'users' collection
+        # Create user document in Firestore 'users' collection with real UID
         user_profile = {
             "uid": uid,
             "email": email,
@@ -245,6 +261,7 @@ def register_user():
         }
 
         db.collection(COLLECTION_USERS).document(uid).set(user_profile)
+        logger.info(f"Successfully registered owner user '{email}' with UID '{uid}'.")
 
         return jsonify({
             "message": "User registered successfully",
@@ -254,8 +271,8 @@ def register_user():
     except Exception as e:
         logger.exception(f"Unexpected error in /api/auth/register: {e}")
         return jsonify({
-            "error": "Failed to register user",
-            "details": str(e)
+            "error": "Internal Server Error",
+            "message": "Failed to register user due to an internal error."
         }), 500
 
 
@@ -264,7 +281,8 @@ def register_user():
 @require_role("admin")
 def admin_create_user():
     """
-    Admin-only user creation endpoint. Allows an authenticated Admin to create technician or admin accounts.
+    Admin-only user creation endpoint. Allows an authenticated Admin to create
+    technician, admin, or owner accounts.
     Payload: {email, password, name, role}
     """
     try:
@@ -284,15 +302,23 @@ def admin_create_user():
             return jsonify({"error": "Password must be at least 6 characters long"}), 400
 
         if role not in VALID_ROLES:
-            return jsonify({"error": f"Invalid role '{role}'. Allowed roles: {VALID_ROLES}"}), 400
+            return jsonify({
+                "error": "Bad Request",
+                "message": f"Invalid role '{role}'. Allowed roles: {VALID_ROLES}"
+            }), 400
 
         db = get_db()
         if db is None:
+            logger.error("Database handle unavailable in admin_create_user")
             return jsonify({"error": "Database connection unavailable"}), 500
 
         existing_users = list(db.collection(COLLECTION_USERS).where("email", "==", email).limit(1).stream())
         if existing_users:
-            return jsonify({"error": f"A user with email '{email}' already exists."}), 409
+            logger.warning(f"Admin user creation conflict: email '{email}' already exists in Firestore.")
+            return jsonify({
+                "error": "Conflict",
+                "message": "A user with this email already exists."
+            }), 409
 
         try:
             user_record = auth.create_user(
@@ -302,10 +328,17 @@ def admin_create_user():
             )
             uid = user_record.uid
         except auth.EmailAlreadyExistsError:
-            return jsonify({"error": f"A user with email '{email}' already exists in Firebase Auth."}), 409
+            logger.warning(f"Admin user creation conflict: email '{email}' already exists in Firebase Auth.")
+            return jsonify({
+                "error": "Conflict",
+                "message": "A user with this email already exists."
+            }), 409
         except Exception as auth_err:
-            logger.error(f"Admin create_user failed: {auth_err}")
-            return jsonify({"error": f"Failed to create user in Firebase Auth: {str(auth_err)}"}), 400
+            logger.error(f"Admin create_user failed for '{email}': {auth_err}")
+            return jsonify({
+                "error": "Bad Request",
+                "message": f"Failed to create user in Firebase Auth: {str(auth_err)}"
+            }), 400
 
         user_profile = {
             "uid": uid,
@@ -316,6 +349,7 @@ def admin_create_user():
         }
 
         db.collection(COLLECTION_USERS).document(uid).set(user_profile)
+        logger.info(f"Admin created user '{email}' with role '{role}' and UID '{uid}'.")
 
         return jsonify({
             "message": "User created successfully by admin",
@@ -324,14 +358,17 @@ def admin_create_user():
 
     except Exception as e:
         logger.exception(f"Unexpected error in /api/auth/users: {e}")
-        return jsonify({"error": "Failed to create user", "details": str(e)}), 500
+        return jsonify({
+            "error": "Internal Server Error",
+            "message": "Failed to create user due to an internal error."
+        }), 500
 
 
 @auth_bp.route("/api/auth/me", methods=["GET"])
 @require_auth
 def get_current_user_profile():
     """
-    Returns current authenticated user profile. Protected by @require_auth.
+    Returns current authenticated user profile from Firestore. Protected by @require_auth.
     """
     user = getattr(g, "user", None) or getattr(request, "user", None)
     return jsonify(user), 200
@@ -341,7 +378,7 @@ def get_current_user_profile():
 @require_auth
 @require_role("admin")
 def admin_only_route():
-    """Demo endpoint restricted to admin role."""
+    """Endpoint restricted to admin role."""
     user = getattr(g, "user", None) or getattr(request, "user", None)
     return jsonify({"message": f"Welcome Admin {user.get('name')}", "user": user}), 200
 
@@ -350,6 +387,6 @@ def admin_only_route():
 @require_auth
 @require_role("technician", "admin")
 def tech_only_route():
-    """Demo endpoint restricted to technician or admin roles."""
+    """Endpoint restricted to technician or admin roles."""
     user = getattr(g, "user", None) or getattr(request, "user", None)
     return jsonify({"message": f"Welcome Technician/Admin {user.get('name')}", "user": user}), 200

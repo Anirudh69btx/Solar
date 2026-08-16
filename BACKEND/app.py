@@ -8,6 +8,7 @@ alert notifications, and system health checks.
 import os
 import sys
 import time
+import logging
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -21,6 +22,17 @@ from BACKEND.firebase_config import get_db
 from BACKEND.analysis import run_analysis
 from BACKEND.chatbot import get_chat_response
 from BACKEND.auth import auth_bp
+from BACKEND.sites import sites_bp
+from BACKEND.systems import systems_bp
+from BACKEND.assignments import assignments_bp
+from BACKEND.reports import reports_bp
+
+# Configure backend logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 # Enable CORS for all routes (enables future React/Vue/Angular frontend integration)
@@ -28,6 +40,18 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Register Authentication Blueprint
 app.register_blueprint(auth_bp)
+
+# Register Solar Sites Blueprint (Multi-Site Management)
+app.register_blueprint(sites_bp)
+
+# Register Solar Systems Blueprint (Segment 8)
+app.register_blueprint(systems_bp)
+
+# Register Technician Assignments Blueprint
+app.register_blueprint(assignments_bp)
+
+# Register Solar Reports Blueprint (Segment 9)
+app.register_blueprint(reports_bp)
 
 COLLECTION_READINGS = "readings"
 COLLECTION_ALERTS = "alerts"
@@ -63,6 +87,7 @@ def get_latest_readings():
 
         db = get_db()
         if db is None:
+            logger.error("Database connection unavailable in /api/readings/latest")
             return jsonify({"error": "Database connection unavailable"}), 500
 
         # Query readings collection ordered by unix_timestamp descending
@@ -80,7 +105,7 @@ def get_latest_readings():
         return jsonify(readings), 200
 
     except Exception as e:
-        print(f"[API ERROR] Error in /api/readings/latest: {e}", file=sys.stderr)
+        logger.exception(f"Error in /api/readings/latest: {e}")
         return jsonify({
             "error": "Failed to fetch latest readings",
             "details": str(e)
@@ -186,6 +211,7 @@ def ingest_reading():
 
         db = get_db()
         if db is None:
+            logger.error("Database connection unavailable in /api/ingest")
             return jsonify({"error": "Database connection unavailable"}), 500
 
         doc_id = f"read_{cleaned_reading['unix_timestamp']}"
@@ -203,7 +229,7 @@ def ingest_reading():
         }), 201
 
     except Exception as e:
-        print(f"[API ERROR] Error in /api/ingest: {e}", file=sys.stderr)
+        logger.exception(f"Error in /api/ingest: {e}")
         return jsonify({
             "error": "Failed to ingest sensor data",
             "details": str(e)
@@ -225,6 +251,7 @@ def get_active_alerts():
 
         db = get_db()
         if db is None:
+            logger.error("Database connection unavailable in /api/alerts")
             return jsonify({"error": "Database connection unavailable"}), 500
 
         alerts_ref = db.collection(COLLECTION_ALERTS)
@@ -248,7 +275,7 @@ def get_active_alerts():
         return jsonify(alerts), 200
 
     except Exception as e:
-        print(f"[API ERROR] Error in /api/alerts: {e}", file=sys.stderr)
+        logger.exception(f"Error in /api/alerts: {e}")
         return jsonify({
             "error": "Failed to fetch alerts",
             "details": str(e)
@@ -265,13 +292,14 @@ def trigger_analysis():
     try:
         db = get_db()
         if db is None:
+            logger.error("Database connection unavailable in /api/analysis/run")
             return jsonify({"error": "Database connection unavailable"}), 500
 
         result = run_analysis(db=db)
         return jsonify(result), 200
 
     except Exception as e:
-        print(f"[API ERROR] Error in /api/analysis/run: {e}", file=sys.stderr)
+        logger.exception(f"Error in /api/analysis/run: {e}")
         return jsonify({
             "error": "Failed to run analysis engine",
             "details": str(e)
@@ -305,7 +333,7 @@ def chat_endpoint():
         }), 200
 
     except Exception as e:
-        print(f"[API ERROR] Error in /api/chat: {e}", file=sys.stderr)
+        logger.exception(f"Error in /api/chat: {e}")
         return jsonify({
             "error": "Failed to process chat query",
             "details": str(e)
@@ -313,7 +341,5 @@ def chat_endpoint():
 
 
 if __name__ == "__main__":
-    os.environ["TESTING"] = "1"
-    print("\nStarting Solar Monitoring System Backend API Server...")
-    print("Listening on http://0.0.0.0:5000\n")
+    logger.info("Starting Solar Monitoring System Backend API Server on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
