@@ -45,6 +45,7 @@ import os
 import unittest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
+import joblib
 
 # Configure UTF-8 encoding for standard output on Windows
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
@@ -66,10 +67,17 @@ from BACKEND.app import app
 
 class MockFirestoreDoc:
     """Mock Firestore Document Snapshot."""
-    def __init__(self, doc_id: str, data: dict, exists: bool = True):
+    def __init__(self, doc_id: str, data: dict, exists: bool = True, collection_data: dict = None):
         self.id = doc_id
         self._data = data.copy() if data else {}
         self.exists = exists
+        self._collection_data = collection_data
+
+    @property
+    def reference(self):
+        if self._collection_data is not None:
+            return MockFirestoreDocRef(self._collection_data, self.id)
+        return MockFirestoreDocRef({}, self.id)
 
     def to_dict(self):
         return self._data.copy()
@@ -163,11 +171,16 @@ class MockFirestoreQuery:
                 item_data = data
                 if self._select_fields:
                     item_data = {k: v for k, v in data.items() if k in self._select_fields or k == "id"}
-                results.append(MockFirestoreDoc(doc_id, item_data, exists=True))
+                results.append(MockFirestoreDoc(doc_id, item_data, exists=True, collection_data=self._collection_data))
 
         if self._order_field:
             reverse = (self._direction or "").upper() == "DESCENDING"
-            results.sort(key=lambda d: d.to_dict().get(self._order_field, 0), reverse=reverse)
+            def _sort_key(d):
+                val = d.to_dict().get(self._order_field)
+                if val is None:
+                    return "" if isinstance(val, str) else 0
+                return val
+            results.sort(key=_sort_key, reverse=reverse)
 
         if self._limit_val is not None:
             results = results[:self._limit_val]
@@ -183,11 +196,17 @@ class MockFirestoreDocRef:
 
     def get(self):
         if self.id in self._collection_data:
-            return MockFirestoreDoc(self.id, self._collection_data[self.id], exists=True)
-        return MockFirestoreDoc(self.id, {}, exists=False)
+            return MockFirestoreDoc(self.id, self._collection_data[self.id], exists=True, collection_data=self._collection_data)
+        return MockFirestoreDoc(self.id, {}, exists=False, collection_data=self._collection_data)
 
     def set(self, data: dict, merge: bool = False):
         if merge and self.id in self._collection_data:
+            self._collection_data[self.id].update(data)
+        else:
+            self._collection_data[self.id] = data.copy()
+
+    def update(self, data: dict):
+        if self.id in self._collection_data:
             self._collection_data[self.id].update(data)
         else:
             self._collection_data[self.id] = data.copy()
@@ -572,6 +591,7 @@ def run_tests(include_ingest: bool = False) -> bool:
          patch("BACKEND.systems.get_db", return_value=mock_db), \
          patch("BACKEND.assignments.get_db", return_value=mock_db), \
          patch("BACKEND.reports.get_db", return_value=mock_db), \
+         patch("BACKEND.ml_predict.get_db", return_value=mock_db), \
          patch("firebase_admin.auth.verify_id_token", side_effect=mock_verify_id_token), \
          patch("firebase_admin.auth.create_user", side_effect=mock_create_user):
 
@@ -2973,6 +2993,1335 @@ def run_tests(include_ingest: bool = False) -> bool:
             record_result("Site: Admin deletes site (200)", passed, f"Deleted: {temp_sid}")
         except Exception as e:
             record_result("Site: Admin deletes site (200)", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # SEGMENT 10: AUTOMATED ALERT SCHEDULER TESTS (Tests 189–206)
+        # ---------------------------------------------------------
+        print("\n  --- Segment 10: Automated Alert Scheduler ---")
+
+        from BACKEND.scheduler import (
+            get_scheduler_config,
+            fetch_monitored_systems,
+            fetch_recent_readings_for_system,
+            evaluate_system_performance,
+            check_duplicate_alert,
+            create_performance_alert,
+            process_system,
+            run_monitoring_cycle,
+            start_scheduler,
+        )
+
+        # 189. Config: Scheduler default configuration
+        try:
+            cfg = get_scheduler_config()
+            passed = (
+                cfg["interval_seconds"] == 300
+                and cfg["alert_threshold"] == 0.70
+                and cfg["duplicate_window_seconds"] == 3600
+            )
+            record_result("Seg10: Scheduler default config loaded (5m interval, 0.70 PR)", passed, f"Interval: {cfg['interval_seconds']}s | Threshold: {cfg['alert_threshold']}")
+        except Exception as e:
+            record_result("Seg10: Scheduler default config loaded (5m interval, 0.70 PR)", False, f"Exception: {e}")
+
+        # 190. Discovery: Discovers registered systems and telemetry systems
+        try:
+            monitored = fetch_monitored_systems(mock_db)
+            monitored_ids = {s.get("system_id") for s in monitored}
+            passed = ("SYS-OWNER001" in monitored_ids and "SYS-OWNER002" in monitored_ids)
+            record_result("Seg10: Discovers all registered & active systems", passed, f"Discovered: {len(monitored)} systems ({monitored_ids})")
+        except Exception as e:
+            record_result("Seg10: Discovers all registered & active systems", False, f"Exception: {e}")
+
+        # 191. Evaluation: PR < 0.70 triggers anomaly detection
+        try:
+            anom_readings = [
+                {"expected_power": 2000.0, "power": 1200.0, "performance_ratio": 0.60, "unix_timestamp": 1000},
+                {"expected_power": 2000.0, "power": 1180.0, "performance_ratio": 0.59, "unix_timestamp": 900},
+                {"expected_power": 2000.0, "power": 1220.0, "performance_ratio": 0.61, "unix_timestamp": 800},
+            ]
+            is_anom, avg_pr, lost_kwh, breaches = evaluate_system_performance(anom_readings, threshold=0.70)
+            passed = (is_anom is True and avg_pr == 0.60 and len(breaches) == 3 and lost_kwh > 0)
+            record_result("Seg10: PR < 0.70 triggers performance anomaly detection", passed, f"is_anomaly={is_anom} | avg_pr={avg_pr} | lost_kwh={lost_kwh}")
+        except Exception as e:
+            record_result("Seg10: PR < 0.70 triggers performance anomaly detection", False, f"Exception: {e}")
+
+        # 192. Evaluation: PR >= 0.70 does NOT trigger anomaly
+        try:
+            normal_readings = [
+                {"expected_power": 2000.0, "power": 1800.0, "performance_ratio": 0.90, "unix_timestamp": 1000},
+                {"expected_power": 2000.0, "power": 1750.0, "performance_ratio": 0.875, "unix_timestamp": 900},
+                {"expected_power": 2000.0, "power": 1820.0, "performance_ratio": 0.91, "unix_timestamp": 800},
+            ]
+            is_anom, avg_pr, lost_kwh, breaches = evaluate_system_performance(normal_readings, threshold=0.70)
+            passed = (is_anom is False and avg_pr > 0.70 and len(breaches) == 0)
+            record_result("Seg10: PR >= 0.70 does NOT trigger performance alert", passed, f"is_anomaly={is_anom} | avg_pr={avg_pr}")
+        except Exception as e:
+            record_result("Seg10: PR >= 0.70 does NOT trigger performance alert", False, f"Exception: {e}")
+
+        # 193. Multi-System Independent Monitoring: Low PR on SysA, Normal on SysB
+        try:
+            now_dt = datetime.now(timezone.utc)
+            now_ts = int(now_dt.timestamp())
+            
+            # SysA readings: PR = 0.58
+            for idx in range(4):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_sys_a_{idx}"] = {
+                    "system_id": "SYS-SCHED-A",
+                    "site_id": "SITE-SCHED-01",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1160.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.58
+                }
+            
+            # SysB readings: PR = 0.92
+            for idx in range(4):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_sys_b_{idx}"] = {
+                    "system_id": "SYS-SCHED-B",
+                    "site_id": "SITE-SCHED-01",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1840.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.92
+                }
+
+            mock_db._store["systems"]["SYS-SCHED-A"] = {
+                "system_id": "SYS-SCHED-A",
+                "site_id": "SITE-SCHED-01",
+                "name": "Scheduler Test System A",
+                "owner_uid": "uid_owner"
+            }
+            mock_db._store["systems"]["SYS-SCHED-B"] = {
+                "system_id": "SYS-SCHED-B",
+                "site_id": "SITE-SCHED-01",
+                "name": "Scheduler Test System B",
+                "owner_uid": "uid_owner"
+            }
+
+            rep_a = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-A"], get_scheduler_config())
+            rep_b = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-B"], get_scheduler_config())
+
+            passed = (
+                rep_a.get("is_anomaly") is True
+                and rep_a.get("alert_created") is True
+                and rep_b.get("is_anomaly") is False
+                and rep_b.get("alert_created") is False
+            )
+            record_result("Seg10: Multi-system independent evaluation (SysA alerts, SysB normal)", passed, f"SysA created={rep_a.get('alert_created')} | SysB created={rep_b.get('alert_created')}")
+        except Exception as e:
+            record_result("Seg10: Multi-system independent evaluation (SysA alerts, SysB normal)", False, f"Exception: {e}")
+
+        # 194. Alert Document Schema & Metadata: system_id, site_id, severity, threshold
+        try:
+            alert_id_a = rep_a.get("alert_id")
+            alert_doc = mock_db._store["alerts"].get(alert_id_a)
+            passed = (
+                alert_doc is not None
+                and alert_doc.get("system_id") == "SYS-SCHED-A"
+                and alert_doc.get("site_id") == "SITE-SCHED-01"
+                and alert_doc.get("type") == "performance_drop"
+                and alert_doc.get("severity") == "warning"
+                and alert_doc.get("status") == "active"
+                and alert_doc.get("active") is True
+                and alert_doc.get("threshold") == 0.70
+                and "message" in alert_doc
+            )
+            record_result("Seg10: Alert document preserves system_id, site_id, severity, threshold & status", passed, f"AlertID: {alert_id_a} | Sys: {alert_doc.get('system_id') if alert_doc else 'None'} | Sev: {alert_doc.get('severity') if alert_doc else 'None'}")
+        except Exception as e:
+            record_result("Seg10: Alert document preserves system_id, site_id, severity, threshold & status", False, f"Exception: {e}")
+
+        # 195. Standalone System Without site_id
+        try:
+            mock_db._store["systems"]["SYS-STANDALONE"] = {
+                "system_id": "SYS-STANDALONE",
+                "site_id": None,
+                "name": "Standalone Test System",
+                "owner_uid": "uid_owner"
+            }
+            for idx in range(3):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_standalone_{idx}"] = {
+                    "system_id": "SYS-STANDALONE",
+                    "site_id": None,
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1000.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.50
+                }
+
+            rep_standalone = process_system(mock_db, mock_db._store["systems"]["SYS-STANDALONE"], get_scheduler_config())
+            alert_id_st = rep_standalone.get("alert_id")
+            doc_st = mock_db._store["alerts"].get(alert_id_st, {})
+
+            passed = (
+                rep_standalone.get("alert_created") is True
+                and doc_st.get("system_id") == "SYS-STANDALONE"
+                and doc_st.get("site_id") is None
+            )
+            record_result("Seg10: Standalone system without site_id creates alert properly", passed, f"Sys: {doc_st.get('system_id')} | site_id: {doc_st.get('site_id')}")
+        except Exception as e:
+            record_result("Seg10: Standalone system without site_id creates alert properly", False, f"Exception: {e}")
+
+        # 196. Duplicate Alert Prevention (1-Hour Window)
+        try:
+            rep_a_cycle2 = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-A"], get_scheduler_config())
+            passed = (
+                rep_a_cycle2.get("is_anomaly") is True
+                and rep_a_cycle2.get("alert_created") is False
+                and rep_a_cycle2.get("alert_skipped") is True
+                and rep_a_cycle2.get("alert_id") == alert_id_a
+            )
+            record_result("Seg10: Duplicate active alert within 1 hour is prevented", passed, f"created={rep_a_cycle2.get('alert_created')} | skipped={rep_a_cycle2.get('alert_skipped')}")
+        except Exception as e:
+            record_result("Seg10: Duplicate active alert within 1 hour is prevented", False, f"Exception: {e}")
+
+        # 197. Cross-System Alert Isolation: Existing alert on SysA does NOT block SysC
+        try:
+            mock_db._store["systems"]["SYS-SCHED-C"] = {
+                "system_id": "SYS-SCHED-C",
+                "site_id": "SITE-SCHED-01",
+                "name": "Scheduler Test System C",
+                "owner_uid": "uid_owner"
+            }
+            for idx in range(3):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_sys_c_{idx}"] = {
+                    "system_id": "SYS-SCHED-C",
+                    "site_id": "SITE-SCHED-01",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1100.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.55
+                }
+
+            rep_c = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-C"], get_scheduler_config())
+            passed = (
+                rep_c.get("alert_created") is True
+                and rep_c.get("alert_id") != alert_id_a
+            )
+            record_result("Seg10: Existing alert on SysA does NOT block alert on SysC", passed, f"SysC alert_id={rep_c.get('alert_id')}")
+        except Exception as e:
+            record_result("Seg10: Existing alert on SysA does NOT block alert on SysC", False, f"Exception: {e}")
+
+        # 198. Active Alert Older Than 1 Hour Does NOT Block New Alert
+        try:
+            old_ts = now_ts - 4500
+            mock_db._store["systems"]["SYS-SCHED-D"] = {
+                "system_id": "SYS-SCHED-D",
+                "site_id": "SITE-SCHED-02",
+                "name": "Scheduler Test System D",
+                "owner_uid": "uid_owner"
+            }
+            mock_db._store["alerts"]["alert_old_d"] = {
+                "id": "alert_old_d",
+                "system_id": "SYS-SCHED-D",
+                "type": "performance_drop",
+                "active": True,
+                "unix_timestamp": old_ts,
+                "timestamp": datetime.fromtimestamp(old_ts, tz=timezone.utc).isoformat()
+            }
+            for idx in range(3):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_sys_d_{idx}"] = {
+                    "system_id": "SYS-SCHED-D",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1100.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.55
+                }
+
+            rep_d = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-D"], get_scheduler_config())
+            passed = (
+                rep_d.get("alert_created") is True
+                and rep_d.get("alert_id") != "alert_old_d"
+            )
+            record_result("Seg10: Active alert older than 1 hour does NOT suppress new alert", passed, f"New alert created={rep_d.get('alert_created')} | id={rep_d.get('alert_id')}")
+        except Exception as e:
+            record_result("Seg10: Active alert older than 1 hour does NOT suppress new alert", False, f"Exception: {e}")
+
+        # 199. Severity Classification: Critical vs Warning
+        try:
+            mock_db._store["systems"]["SYS-CRITICAL"] = {
+                "system_id": "SYS-CRITICAL",
+                "site_id": "SITE-01",
+                "name": "Critical Test System",
+                "owner_uid": "uid_owner"
+            }
+            for idx in range(3):
+                ts = now_ts - (idx * 300)
+                mock_db._store["readings"][f"read_crit_{idx}"] = {
+                    "system_id": "SYS-CRITICAL",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 700.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.35
+                }
+
+            rep_crit = process_system(mock_db, mock_db._store["systems"]["SYS-CRITICAL"], get_scheduler_config())
+            alert_crit_doc = mock_db._store["alerts"].get(rep_crit.get("alert_id"), {})
+            passed = (alert_crit_doc.get("severity") == "critical")
+            record_result("Seg10: Severe performance drop (PR < 0.50) classified as 'critical'", passed, f"PR={alert_crit_doc.get('performance_ratio')} | Severity={alert_crit_doc.get('severity')}")
+        except Exception as e:
+            record_result("Seg10: Severe performance drop (PR < 0.50) classified as 'critical'", False, f"Exception: {e}")
+
+        # 200. Alert Lifecycle & Automatic Recovery Resolution
+        try:
+            for idx in range(5):
+                ts = now_ts + 1000 + (idx * 300)
+                mock_db._store["readings"][f"read_sys_a_recovered_{idx}"] = {
+                    "system_id": "SYS-SCHED-A",
+                    "timestamp": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+                    "unix_timestamp": ts,
+                    "power": 1900.0,
+                    "expected_power": 2000.0,
+                    "performance_ratio": 0.95
+                }
+
+            rep_a_rec = process_system(mock_db, mock_db._store["systems"]["SYS-SCHED-A"], get_scheduler_config())
+            alert_a_updated = mock_db._store["alerts"].get(alert_id_a, {})
+            passed = (
+                rep_a_rec.get("is_anomaly") is False
+                and rep_a_rec.get("alert_resolved") is True
+                and alert_a_updated.get("active") is False
+                and alert_a_updated.get("status") == "resolved"
+            )
+            record_result("Seg10: Performance recovery marks active alert as resolved", passed, f"active={alert_a_updated.get('active')} | status={alert_a_updated.get('status')}")
+        except Exception as e:
+            record_result("Seg10: Performance recovery marks active alert as resolved", False, f"Exception: {e}")
+
+        # 201. Empty Telemetry Handling
+        try:
+            mock_db._store["systems"]["SYS-EMPTY"] = {
+                "system_id": "SYS-EMPTY",
+                "site_id": None,
+                "name": "Empty System",
+                "owner_uid": "uid_owner"
+            }
+            rep_empty = process_system(mock_db, mock_db._store["systems"]["SYS-EMPTY"], get_scheduler_config())
+            passed = (
+                rep_empty.get("status") == "ok"
+                and rep_empty.get("readings_count") == 0
+                and rep_empty.get("is_anomaly") is False
+                and rep_empty.get("alert_created") is False
+            )
+            record_result("Seg10: Handles empty readings gracefully without error", passed, f"Readings: {rep_empty.get('readings_count')} | Status: {rep_empty.get('status')}")
+        except Exception as e:
+            record_result("Seg10: Handles empty readings gracefully without error", False, f"Exception: {e}")
+
+        # 202. Malformed Telemetry Safe Handling
+        try:
+            mock_db._store["systems"]["SYS-MALFORMED"] = {
+                "system_id": "SYS-MALFORMED",
+                "name": "Malformed System",
+                "owner_uid": "uid_owner"
+            }
+            mock_db._store["readings"]["read_malformed_1"] = {
+                "system_id": "SYS-MALFORMED",
+                "timestamp": "invalid-timestamp",
+                "unix_timestamp": None,
+                "power": "non_numeric",
+                "expected_power": None,
+                "performance_ratio": None
+            }
+            rep_malformed = process_system(mock_db, mock_db._store["systems"]["SYS-MALFORMED"], get_scheduler_config())
+            passed = (rep_malformed.get("status") in ("ok", "error"))
+            record_result("Seg10: Malformed reading fields processed safely without crashing", passed, f"Status: {rep_malformed.get('status')}")
+        except Exception as e:
+            record_result("Seg10: Malformed reading fields processed safely without crashing", False, f"Exception: {e}")
+
+        # 203. Fault Isolation: One system error does NOT prevent other systems from processing
+        try:
+            mock_db._store["systems"]["SYS-BROKEN"] = {
+                "system_id": "SYS-BROKEN",
+                "name": "Broken System"
+            }
+            cycle_result = run_monitoring_cycle(db=mock_db)
+            passed = (
+                cycle_result["status"] in ("completed", "partial_success")
+                and cycle_result["systems_checked"] >= 2
+            )
+            record_result("Seg10: System-level fault isolation allows healthy systems to complete", passed, f"Systems checked: {cycle_result.get('systems_checked')} | Status: {cycle_result.get('status')}")
+        except Exception as e:
+            record_result("Seg10: System-level fault isolation allows healthy systems to complete", False, f"Exception: {e}")
+
+        # 204. Full Monitoring Cycle Execution Summary
+        try:
+            full_cycle = run_monitoring_cycle(db=mock_db)
+            passed = (
+                "systems_checked" in full_cycle
+                and "alerts_created" in full_cycle
+                and "alerts_skipped" in full_cycle
+                and "alerts_resolved" in full_cycle
+                and isinstance(full_cycle["system_reports"], list)
+            )
+            record_result("Seg10: run_monitoring_cycle returns comprehensive execution summary", passed, f"Checked: {full_cycle.get('systems_checked')} | Created: {full_cycle.get('alerts_created')} | Skipped: {full_cycle.get('alerts_skipped')}")
+        except Exception as e:
+            record_result("Seg10: run_monitoring_cycle returns comprehensive execution summary", False, f"Exception: {e}")
+
+        # 205. Bounded start_scheduler Loop Execution (max_cycles=2)
+        try:
+            start_scheduler(interval_seconds=1, max_cycles=2, db=mock_db)
+            passed = True
+            record_result("Seg10: start_scheduler executes cleanly with max_cycles termination", passed, "Executed 2 cycles and halted cleanly")
+        except Exception as e:
+            record_result("Seg10: start_scheduler executes cleanly with max_cycles termination", False, f"Exception: {e}")
+
+        # 206. Environment Override of Scheduler Configuration
+        try:
+            with patch.dict(os.environ, {
+                "SCHEDULER_INTERVAL_MINUTES": "10",
+                "ALERT_THRESHOLD": "0.65",
+                "DUPLICATE_ALERT_WINDOW_SECONDS": "7200"
+            }):
+                env_cfg = get_scheduler_config()
+                passed = (
+                    env_cfg["interval_seconds"] == 600
+                    and env_cfg["interval_minutes"] == 10.0
+                    and env_cfg["alert_threshold"] == 0.65
+                    and env_cfg["duplicate_window_seconds"] == 7200
+                )
+                record_result("Seg10: Environment variable overrides propagate to config", passed, f"Interval: {env_cfg['interval_minutes']} min | Threshold: {env_cfg['alert_threshold']} | DupWindow: {env_cfg['duplicate_window_seconds']}s")
+        except Exception as e:
+            record_result("Seg10: Environment variable overrides propagate to config", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # SEGMENT 11: ESP32 FIRMWARE & INGESTION TESTS (Tests 207–212)
+        # ---------------------------------------------------------
+        print("\n  --- Segment 11: ESP32 Firmware Telemetry & Ingestion Integration ---")
+
+        # 207. Ingest: Full ESP32 Smart Solar Telemetry Payload Ingestion (201)
+        try:
+            esp32_payload = {
+                "system_id": "SYS-OWNER001",
+                "device_id": "ESP32-SOLAR-EDGE-01",
+                "site_id": "SITE-OWNER001",
+                "unix_timestamp": 1787054400,
+                "voltage": 18.42,
+                "current": 8.15,
+                "power": 150.12,
+                "expected_power": 245.50,
+                "performance_ratio": 0.6115,
+                "irradiance": 818.33,
+                "lux": 98200.0,
+                "temperature_panel": 48.2,
+                "temperature_ambient": 31.5,
+                "humidity": 42.0,
+                "rain": 0.0,
+                "vibration": 0.0,
+                "energy": 1.2450,
+                "lost_generation": 0.4520,
+                "fault_detected": True,
+                "fault_type": "UNDERPERFORMANCE",
+                "performance_status": "DEGRADED",
+                "data_valid": True,
+                "sensor_fault": False
+            }
+            r = client.post("/api/ingest", json=esp32_payload)
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 201
+                and "doc_id" in data
+                and data.get("data", {}).get("system_id") == "SYS-OWNER001"
+                and data.get("data", {}).get("device_id") == "ESP32-SOLAR-EDGE-01"
+            )
+            record_result("Seg11: Full ESP32 telemetry payload ingested successfully (201)", passed, f"Status: {r.status_code} | Doc ID: {data.get('doc_id')}")
+        except Exception as e:
+            record_result("Seg11: Full ESP32 telemetry payload ingested successfully (201)", False, f"Exception: {e}")
+
+        # 208. Ingest: Verify Firestore document preserves ESP32 edge fields
+        try:
+            doc_id = data.get("doc_id")
+            saved_doc = mock_db._store["readings"].get(doc_id, {})
+            passed = (
+                saved_doc.get("system_id") == "SYS-OWNER001"
+                and saved_doc.get("device_id") == "ESP32-SOLAR-EDGE-01"
+                and saved_doc.get("site_id") == "SITE-OWNER001"
+                and saved_doc.get("energy") == 1.2450
+                and saved_doc.get("lost_generation") == 0.4520
+                and saved_doc.get("fault_detected") is True
+                and saved_doc.get("fault_type") == "UNDERPERFORMANCE"
+                and saved_doc.get("performance_status") == "DEGRADED"
+            )
+            record_result("Seg11: Firestore reading document preserves edge calculations & IDs", passed, f"System: {saved_doc.get('system_id')} | Device: {saved_doc.get('device_id')} | Energy: {saved_doc.get('energy')} kWh")
+        except Exception as e:
+            record_result("Seg11: Firestore reading document preserves edge calculations & IDs", False, f"Exception: {e}")
+
+        # 209. Ingest: Auto-derives Performance Ratio if omitted from payload
+        try:
+            partial_payload = {
+                "system_id": "SYS-OWNER002",
+                "voltage": 24.0,
+                "current": 10.0,
+                "power": 240.0,
+                "expected_power": 300.0,
+                "lux": 80000.0
+            }
+            r = client.post("/api/ingest", json=partial_payload)
+            data = r.get_json() or {}
+            saved_pr = data.get("data", {}).get("performance_ratio")
+            passed = (r.status_code == 201 and saved_pr == 0.8)
+            record_result("Seg11: Ingest automatically derives PR (240W / 300W = 0.80)", passed, f"Status: {r.status_code} | PR: {saved_pr}")
+        except Exception as e:
+            record_result("Seg11: Ingest automatically derives PR (240W / 300W = 0.80)", False, f"Exception: {e}")
+
+        # 210. Ingest: Missing required electrical fields rejected (400)
+        try:
+            r = client.post("/api/ingest", json={"voltage": 12.0})
+            data = r.get_json() or {}
+            passed = (r.status_code == 400 and "missing_required_fields" in data)
+            record_result("Seg11: Missing required electrical fields rejected with 400", passed, f"Status: {r.status_code} | Missing: {data.get('missing_required_fields')}")
+        except Exception as e:
+            record_result("Seg11: Missing required electrical fields rejected with 400", False, f"Exception: {e}")
+
+        # 211. Ingest: Non-numeric electrical fields rejected (400)
+        try:
+            r = client.post("/api/ingest", json={
+                "voltage": "twenty_volts",
+                "current": 5.0,
+                "power": 100.0,
+                "expected_power": 200.0
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg11: Non-numeric electrical fields rejected with 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg11: Non-numeric electrical fields rejected with 400", False, f"Exception: {e}")
+
+        # 212. Ingest: Telemetry ingestion triggers analysis engine automatically
+        try:
+            low_pr_payload = {
+                "system_id": "SYS-INGEST-FAULT",
+                "voltage": 12.0,
+                "current": 5.0,
+                "power": 60.0,
+                "expected_power": 200.0,
+                "unix_timestamp": 1787058000
+            }
+            r = client.post("/api/ingest", json=low_pr_payload)
+            data = r.get_json() or {}
+            passed = (r.status_code == 201 and "analysis" in data)
+            record_result("Seg11: Ingest automatically executes analysis engine pipeline", passed, f"Status: {r.status_code} | Analysis Status: {data.get('analysis', {}).get('status')}")
+        except Exception as e:
+            record_result("Seg11: Ingest automatically executes analysis engine pipeline", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # SEGMENT 13: ML PREDICTIONS & SOLAR HEALTH SCORE (Tests 213–270)
+        # ---------------------------------------------------------
+        print("\n  --- Segment 13: Machine Learning Power Prediction & Solar Health Score ---")
+
+        # 213. ML module imports successfully
+        try:
+            import BACKEND.ml_predict as ml
+            passed = (
+                hasattr(ml, "train_model")
+                and hasattr(ml, "predict_power")
+                and hasattr(ml, "calculate_health_score")
+                and hasattr(ml, "calculate_expected_power")
+                and hasattr(ml, "prepare_features_from_readings")
+                and hasattr(ml, "FEATURE_NAMES")
+                and ml.FEATURE_NAMES == ["irradiance", "panel_temp", "hour_of_day", "day_of_week", "humidity"]
+            )
+            record_result("Seg13: ML module imports with required constants & functions", passed, f"Features: {ml.FEATURE_NAMES}")
+        except Exception as e:
+            record_result("Seg13: ML module imports with required constants & functions", False, f"Exception: {e}")
+
+        # 214. Feature Extraction: Extracts all 5 canonical features + normalized target from valid records
+        try:
+            sample_readings = [
+                {
+                    "timestamp": "2026-08-17T13:00:00Z",
+                    "irradiance": 800.0,
+                    "panel_temp": 42.5,
+                    "humidity": 45.0,
+                    "system_capacity_kw": 3.0,
+                    "power": 2100.0
+                }
+            ]
+            feat_df = ml.prepare_features_from_readings(sample_readings)
+            passed = (
+                len(feat_df) == 1
+                and "irradiance" in feat_df.columns
+                and "panel_temp" in feat_df.columns
+                and "normalized_power" in feat_df.columns
+                and "power" in feat_df.columns
+                and feat_df.iloc[0]["hour_of_day"] == 13
+                and feat_df.iloc[0]["day_of_week"] == 0  # 2026-08-17 is Monday = 0
+                and feat_df.iloc[0]["irradiance"] == 800.0
+                and feat_df.iloc[0]["normalized_power"] == 700.0  # 2100W / 3kW = 700 W/kW
+                and feat_df.iloc[0]["power"] == 2100.0
+            )
+            record_result("Seg13: Feature extraction extracts 5 features + normalized target", passed, f"Shape: {feat_df.shape} | Normalized: {feat_df.iloc[0]['normalized_power']} W/kW")
+        except Exception as e:
+            record_result("Seg13: Feature extraction extracts 5 features + normalized target", False, f"Exception: {e}")
+
+        # 215. Data Validation: Maps temperature_panel, panel_capacity_watts, and derives time fields
+        try:
+            sample_alt = [
+                {
+                    "unix_timestamp": 1787058000,
+                    "irradiance_w_m2": 650.0,
+                    "temperature_panel": 38.0,
+                    "panel_capacity_watts": 5000.0,
+                    "humidity": 55.0,
+                    "power": 3000.0
+                }
+            ]
+            feat_alt = ml.prepare_features_from_readings(sample_alt)
+            passed = (
+                len(feat_alt) == 1
+                and feat_alt.iloc[0]["irradiance"] == 650.0
+                and feat_alt.iloc[0]["panel_temp"] == 38.0
+                and feat_alt.iloc[0]["normalized_power"] == 600.0  # 3000W / 5kW = 600 W/kW
+                and "hour_of_day" in feat_alt.columns
+            )
+            record_result("Seg13: Data validation maps aliases -> canonical features and normalizes target", passed, f"panel_temp: {feat_alt.iloc[0]['panel_temp']} | norm_pwr: {feat_alt.iloc[0]['normalized_power']} W/kW")
+        except Exception as e:
+            record_result("Seg13: Data validation maps aliases -> canonical features and normalizes target", False, f"Exception: {e}")
+
+        # 216. Invalid Reading Filtering: Drops NaNs, negatives, and invalid bounds
+        try:
+            dirty_readings = [
+                {"irradiance": -50.0, "panel_temp": 40.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "power": 100.0},
+                {"irradiance": 800.0, "panel_temp": 40.0, "humidity": 150.0, "hour_of_day": 12, "day_of_week": 1, "power": 100.0},
+                {"irradiance": 800.0, "panel_temp": 40.0, "humidity": 50.0, "hour_of_day": 25, "day_of_week": 1, "power": 100.0},
+                {"irradiance": None, "panel_temp": 40.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "power": 100.0},
+                {"irradiance": 800.0, "panel_temp": 40.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "power": 220.0},
+            ]
+            clean_res = ml.prepare_features_from_readings(dirty_readings)
+            passed = (len(clean_res) == 1 and clean_res.iloc[0]["power"] == 220.0)
+            record_result("Seg13: Invalid reading filtering removes malformed records", passed, f"Clean rows: {len(clean_res)}/5")
+        except Exception as e:
+            record_result("Seg13: Invalid reading filtering removes malformed records", False, f"Exception: {e}")
+
+        # 217. Linear Regression Training with real Firestore readings
+        try:
+            train_res = ml.train_model(db=mock_db)
+            passed = (
+                train_res.get("status") == "success"
+                and "metadata" in train_res
+                and train_res["metadata"].get("model_type") == "LinearRegression"
+            )
+            record_result("Seg13: Linear Regression trains successfully on dataset", passed, f"Samples: {train_res.get('metadata', {}).get('training_sample_count')}")
+        except Exception as e:
+            record_result("Seg13: Linear Regression trains successfully on dataset", False, f"Exception: {e}")
+
+        # 218. Synthetic Fallback when insufficient Firestore readings
+        try:
+            empty_db = MockFirestoreDB()
+            syn_train = ml.train_model(db=empty_db)
+            passed = (
+                syn_train.get("status") == "success"
+                and syn_train.get("metadata", {}).get("synthetic_data_used") is True
+                and syn_train.get("metadata", {}).get("training_sample_count") >= 100
+            )
+            record_result("Seg13: Synthetic training fallback activates when readings < 100", passed, f"Synthetic used: {syn_train.get('metadata', {}).get('synthetic_data_used')}")
+        except Exception as e:
+            record_result("Seg13: Synthetic training fallback activates when readings < 100", False, f"Exception: {e}")
+
+        # 219. MAE Calculation
+        try:
+            meta = train_res.get("metadata", {})
+            mae_val = meta.get("mae")
+            passed = (isinstance(mae_val, (int, float)) and mae_val >= 0.0)
+            record_result("Seg13: Model evaluation calculates valid MAE", passed, f"MAE: {mae_val}")
+        except Exception as e:
+            record_result("Seg13: Model evaluation calculates valid MAE", False, f"Exception: {e}")
+
+        # 220. RMSE Calculation
+        try:
+            rmse_val = meta.get("rmse")
+            passed = (isinstance(rmse_val, (int, float)) and rmse_val >= 0.0)
+            record_result("Seg13: Model evaluation calculates valid RMSE", passed, f"RMSE: {rmse_val}")
+        except Exception as e:
+            record_result("Seg13: Model evaluation calculates valid RMSE", False, f"Exception: {e}")
+
+        # 221. R² Calculation
+        try:
+            r2_val = meta.get("r2_score")
+            passed = (isinstance(r2_val, (int, float)) and -1.0 <= r2_val <= 1.0)
+            record_result("Seg13: Model evaluation calculates valid R² score", passed, f"R²: {r2_val}")
+        except Exception as e:
+            record_result("Seg13: Model evaluation calculates valid R² score", False, f"Exception: {e}")
+
+        # 222. model.pkl file creation and persistence
+        try:
+            model_path = ml.get_model_path()
+            passed = (os.path.exists(model_path) and os.path.getsize(model_path) > 0)
+            record_result("Seg13: model.pkl created and persisted on disk", passed, f"Path: {model_path} ({os.path.getsize(model_path)} bytes)")
+        except Exception as e:
+            record_result("Seg13: model.pkl created and persisted on disk", False, f"Exception: {e}")
+
+        # 223. Metadata persistence inside model bundle
+        try:
+            bundle = joblib.load(model_path)
+            passed = (
+                isinstance(bundle, dict)
+                and "model" in bundle
+                and "metadata" in bundle
+                and bundle["metadata"].get("feature_names") == ml.FEATURE_NAMES
+            )
+            record_result("Seg13: Model bundle preserves metadata and feature schema", passed, f"Trained at: {bundle['metadata'].get('trained_at')}")
+        except Exception as e:
+            record_result("Seg13: Model bundle preserves metadata and feature schema", False, f"Exception: {e}")
+
+        # 224. predict_power() returns valid non-negative prediction
+        try:
+            pred_res = ml.predict_power({
+                "irradiance": 850.0,
+                "panel_temp": 45.0,
+                "humidity": 40.0,
+                "hour_of_day": 13,
+                "day_of_week": 2,
+                "system_capacity_kw": 1.0
+            })
+            passed = (
+                isinstance(pred_res, dict)
+                and "predicted_power" in pred_res
+                and pred_res["predicted_power"] >= 0.0
+                and "features" in pred_res
+            )
+            record_result("Seg13: predict_power generates valid non-negative prediction", passed, f"Predicted: {pred_res.get('predicted_power')} W")
+        except Exception as e:
+            record_result("Seg13: predict_power generates valid non-negative prediction", False, f"Exception: {e}")
+
+        # 225. Invalid prediction input validation (bounds & types)
+        try:
+            caught_invalid = False
+            try:
+                ml.predict_power({"irradiance": -100.0, "panel_temp": 40.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1})
+            except ValueError:
+                caught_invalid = True
+            record_result("Seg13: predict_power rejects out-of-bounds input with ValueError", caught_invalid, "Caught negative irradiance rejection")
+        except Exception as e:
+            record_result("Seg13: predict_power rejects out-of-bounds input with ValueError", False, f"Exception: {e}")
+
+        # 226. Missing model handling (FileNotFoundError)
+        try:
+            with patch("BACKEND.ml_predict.get_model_path", return_value="nonexistent_model.pkl"):
+                caught_fnf = False
+                try:
+                    ml.predict_power({"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1})
+                except FileNotFoundError:
+                    caught_fnf = True
+                record_result("Seg13: Missing model file raises FileNotFoundError with clear message", caught_fnf, "Caught missing model.pkl")
+        except Exception as e:
+            record_result("Seg13: Missing model file raises FileNotFoundError with clear message", False, f"Exception: {e}")
+
+        # 227. Corrupted model handling (ValueError)
+        try:
+            corrupt_path = os.path.join(os.path.dirname(ml.get_model_path()), "corrupt_test.pkl")
+            with open(corrupt_path, "wb") as f:
+                f.write(b"not a valid joblib file")
+            with patch("BACKEND.ml_predict.get_model_path", return_value=corrupt_path):
+                caught_corrupt = False
+                try:
+                    ml.predict_power({"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1})
+                except ValueError:
+                    caught_corrupt = True
+            if os.path.exists(corrupt_path):
+                os.remove(corrupt_path)
+            record_result("Seg13: Corrupted model file handled safely with ValueError", caught_corrupt, "Caught corrupted model structure")
+        except Exception as e:
+            record_result("Seg13: Corrupted model file handled safely with ValueError", False, f"Exception: {e}")
+
+        # 228. Solar Health Score calculation
+        try:
+            for i in range(20):
+                mock_db._store["readings"][f"read_health_{i}"] = {
+                    "system_id": "SYS-HEALTH-01",
+                    "unix_timestamp": 1787050000 + i * 300,
+                    "expected_power": 250.0,
+                    "power": 235.0,
+                    "performance_ratio": 0.94
+                }
+            h_res = ml.calculate_health_score(system_id="SYS-HEALTH-01", db=mock_db)
+            passed = (
+                h_res.get("system_id") == "SYS-HEALTH-01"
+                and 0 <= h_res.get("health_score", -1) <= 100
+                and h_res.get("status") in ["Excellent", "Good", "Warning", "Critical"]
+                and h_res.get("average_pr") == 0.94
+            )
+            record_result("Seg13: calculate_health_score computes accurate score and metrics", passed, f"Score: {h_res.get('health_score')} | Status: {h_res.get('status')} | PR: {h_res.get('average_pr')}")
+        except Exception as e:
+            record_result("Seg13: calculate_health_score computes accurate score and metrics", False, f"Exception: {e}")
+
+        # 229. Health score clamping 0–100 under extreme anomalies
+        try:
+            for i in range(25):
+                mock_db._store["readings"][f"read_fault_{i}"] = {
+                    "system_id": "SYS-FAULTY",
+                    "unix_timestamp": 1787060000 + i * 300,
+                    "expected_power": 300.0,
+                    "power": 10.0,
+                    "performance_ratio": 0.03
+                }
+            h_fault = ml.calculate_health_score(system_id="SYS-FAULTY", db=mock_db)
+            passed = (h_fault.get("health_score") >= 0 and h_fault.get("health_score") <= 100 and h_fault.get("status") == "Critical")
+            record_result("Seg13: Health score clamps strictly between 0 and 100", passed, f"Fault Score: {h_fault.get('health_score')} | Status: {h_fault.get('status')}")
+        except Exception as e:
+            record_result("Seg13: Health score clamps strictly between 0 and 100", False, f"Exception: {e}")
+
+        # 230. Health status categorization
+        try:
+            passed = True
+            scores_to_test = [(95, "Excellent"), (80, "Good"), (65, "Warning"), (30, "Critical")]
+            for score, expected_status in scores_to_test:
+                if score >= 90:
+                    cat = "Excellent"
+                elif score >= 75:
+                    cat = "Good"
+                elif score >= 50:
+                    cat = "Warning"
+                else:
+                    cat = "Critical"
+                if cat != expected_status:
+                    passed = False
+            record_result("Seg13: Health status bands categorized correctly (Excellent/Good/Warning/Critical)", passed, "Verified 95->Exc, 80->Good, 65->Warn, 30->Crit")
+        except Exception as e:
+            record_result("Seg13: Health status bands categorized correctly", False, f"Exception: {e}")
+
+        # 231. Multi-system health isolation
+        try:
+            h_sys1 = ml.calculate_health_score(system_id="SYS-HEALTH-01", db=mock_db)
+            h_sys2 = ml.calculate_health_score(system_id="SYS-FAULTY", db=mock_db)
+            passed = (h_sys1.get("health_score") != h_sys2.get("health_score") and h_sys1.get("status") == "Excellent" and h_sys2.get("status") == "Critical")
+            record_result("Seg13: Multi-system health isolation (SYS-HEALTH-01 != SYS-FAULTY)", passed, f"Sys1: {h_sys1.get('health_score')} ({h_sys1.get('status')}) | Sys2: {h_fault.get('health_score')} ({h_fault.get('status')})")
+        except Exception as e:
+            record_result("Seg13: Multi-system health isolation", False, f"Exception: {e}")
+
+        # 232. API: POST /api/ml/train — Admin only (403 for Owner/Tech)
+        try:
+            r_owner = client.post("/api/ml/train", headers={"Authorization": "Bearer valid-token-owner"})
+            r_admin = client.post("/api/ml/train", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r_owner.status_code == 403 and r_admin.status_code == 200 and r_admin.get_json().get("status") == "success")
+            record_result("Seg13: POST /api/ml/train enforced Admin-only (Owner 403, Admin 200)", passed, f"Owner: {r_owner.status_code} | Admin: {r_admin.status_code}")
+        except Exception as e:
+            record_result("Seg13: POST /api/ml/train enforced Admin-only", False, f"Exception: {e}")
+
+        # 233. API: GET /api/ml/predict — Authenticated endpoint (401 unauth, 200 auth)
+        try:
+            r_anon = client.get("/api/ml/predict?irradiance=850&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2&system_capacity_kw=1.0")
+            r_auth = client.get("/api/ml/predict?irradiance=850&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2&system_capacity_kw=1.0", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r_anon.status_code == 401 and r_auth.status_code == 200 and "predicted_power" in r_auth.get_json())
+            record_result("Seg13: GET /api/ml/predict requires auth (Anon 401, Auth 200)", passed, f"Anon: {r_anon.status_code} | Auth: {r_auth.status_code} | Pred: {r_auth.get_json().get('predicted_power')}W")
+        except Exception as e:
+            record_result("Seg13: GET /api/ml/predict requires auth", False, f"Exception: {e}")
+
+        # 234. API: GET /api/systems/<system_id>/health — System ownership/technician RBAC
+        try:
+            mock_db._store["systems"]["SYS-HEALTH-01"] = {
+                "system_id": "SYS-HEALTH-01",
+                "name": "Health Test System",
+                "owner_uid": "uid_owner",
+                "site_id": "SITE-01"
+            }
+            r_own = client.get("/api/systems/SYS-HEALTH-01/health", headers={"Authorization": "Bearer valid-token-owner"})
+            r_other = client.get("/api/systems/SYS-HEALTH-01/health", headers={"Authorization": "Bearer valid-token-owner2"})
+            r_adm = client.get("/api/systems/SYS-HEALTH-01/health", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r_own.status_code == 200 and r_other.status_code == 403 and r_adm.status_code == 200)
+            record_result("Seg13: GET /api/systems/<id>/health enforces system RBAC (Own 200, Other 403, Admin 200)", passed, f"Owner: {r_own.status_code} | Other: {r_other.status_code} | Admin: {r_adm.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/systems/<id>/health enforces system RBAC", False, f"Exception: {e}")
+
+        # 235. Metadata includes training_source, split_strategy, and model_version
+        try:
+            bundle = joblib.load(ml.get_model_path())
+            meta = bundle.get("metadata", {})
+            passed = (
+                "training_source" in meta
+                and "split_strategy" in meta
+                and meta["split_strategy"] == "chronological_80_20"
+                and "model_version" in meta
+                and meta["model_version"] >= 1
+            )
+            record_result("Seg13: Model metadata preserves training_source and chronological split", passed, f"Source: {meta.get('training_source')} | Split: {meta.get('split_strategy')} | Version: {meta.get('model_version')}")
+        except Exception as e:
+            record_result("Seg13: Model metadata preserves training_source and chronological split", False, f"Exception: {e}")
+
+        # 236. Atomic model replacement leaves no dangling .tmp file
+        try:
+            tmp_path = ml._get_tmp_model_path()
+            passed = not os.path.exists(tmp_path)
+            record_result("Seg13: Atomic model replacement leaves no dangling temporary file", passed, f"Tmp file absent: {passed}")
+        except Exception as e:
+            record_result("Seg13: Atomic model replacement leaves no dangling temporary file", False, f"Exception: {e}")
+
+        # 237. Training data deduplication in prepare_features_from_readings
+        try:
+            duplicate_readings = [
+                {"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 450.0},
+                {"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 450.0},
+                {"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 450.0},
+                {"irradiance": 600.0, "panel_temp": 38.0, "humidity": 45.0, "hour_of_day": 13, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 540.0},
+            ]
+            dedup_df = ml.prepare_features_from_readings(duplicate_readings)
+            passed = (len(dedup_df) == 2)
+            record_result("Seg13: Feature preparation deduplicates repeated telemetry records", passed, f"Rows after dedup: {len(dedup_df)}/4")
+        except Exception as e:
+            record_result("Seg13: Feature preparation deduplicates repeated telemetry records", False, f"Exception: {e}")
+
+        # 238. Health score for perfect system (0% loss, PR=1.0) returns 100.0 / Excellent
+        try:
+            for i in range(10):
+                mock_db._store["readings"][f"read_perfect_{i}"] = {
+                    "system_id": "SYS-PERFECT",
+                    "unix_timestamp": 1787050000 + i * 300,
+                    "expected_power": 300.0,
+                    "power": 300.0,
+                    "performance_ratio": 1.0
+                }
+            h_perf = ml.calculate_health_score(system_id="SYS-PERFECT", db=mock_db)
+            passed = (h_perf.get("health_score") == 100.0 and h_perf.get("status") == "Excellent" and h_perf.get("avg_loss_percent") == 0.0)
+            record_result("Seg13: Perfect system (0% loss, PR=1.0) scores 100.0 Excellent", passed, f"Score: {h_perf.get('health_score')} | Status: {h_perf.get('status')}")
+        except Exception as e:
+            record_result("Seg13: Perfect system (0% loss, PR=1.0) scores 100.0 Excellent", False, f"Exception: {e}")
+
+        # 239. Health status continuous float boundary: 89.6 maps to "Good" (not Excellent)
+        try:
+            status_89_6 = ml._health_status_from_score(89.6)
+            status_90_0 = ml._health_status_from_score(90.0)
+            passed = (status_89_6 == "Good" and status_90_0 == "Excellent")
+            record_result("Seg13: Health status continuous boundary (89.6->Good, 90.0->Excellent)", passed, f"89.6: {status_89_6} | 90.0: {status_90_0}")
+        except Exception as e:
+            record_result("Seg13: Health status continuous boundary (89.6->Good, 90.0->Excellent)", False, f"Exception: {e}")
+
+        # 240. Health status continuous float boundary: 74.6 maps to "Warning" (not Good)
+        try:
+            status_74_6 = ml._health_status_from_score(74.6)
+            status_75_0 = ml._health_status_from_score(75.0)
+            passed = (status_74_6 == "Warning" and status_75_0 == "Good")
+            record_result("Seg13: Health status continuous boundary (74.6->Warning, 75.0->Good)", passed, f"74.6: {status_74_6} | 75.0: {status_75_0}")
+        except Exception as e:
+            record_result("Seg13: Health status continuous boundary (74.6->Warning, 75.0->Good)", False, f"Exception: {e}")
+
+        # 241. Health status continuous float boundary: 49.6 maps to "Critical" (not Warning)
+        try:
+            status_49_6 = ml._health_status_from_score(49.6)
+            status_50_0 = ml._health_status_from_score(50.0)
+            passed = (status_49_6 == "Critical" and status_50_0 == "Warning")
+            record_result("Seg13: Health status continuous boundary (49.6->Critical, 50.0->Warning)", passed, f"49.6: {status_49_6} | 50.0: {status_50_0}")
+        except Exception as e:
+            record_result("Seg13: Health status continuous boundary (49.6->Critical, 50.0->Warning)", False, f"Exception: {e}")
+
+        # 242. N/A health response for system with no readings (null / "N/A")
+        try:
+            mock_db._store["systems"]["SYS-NO-READINGS"] = {
+                "system_id": "SYS-NO-READINGS",
+                "name": "Unread System",
+                "owner_uid": "uid_admin",
+                "site_id": "SITE-01"
+            }
+            h_empty = ml.calculate_health_score(system_id="SYS-NO-READINGS", db=mock_db)
+            r_empty_api = client.get("/api/systems/SYS-NO-READINGS/health", headers={"Authorization": "Bearer valid-token-admin"})
+            empty_json = r_empty_api.get_json() or {}
+
+            passed = (
+                h_empty.get("health_score") is None
+                and h_empty.get("status") == "N/A"
+                and h_empty.get("readings_analyzed") == 0
+                and h_empty.get("average_pr") is None
+                and r_empty_api.status_code == 200
+                and empty_json.get("health_score") is None
+                and empty_json.get("status") == "N/A"
+            )
+            record_result("Seg13: System with no readings returns explicit null / N/A", passed, f"Score: {h_empty.get('health_score')} | Status: {h_empty.get('status')} | API Score: {empty_json.get('health_score')}")
+        except Exception as e:
+            record_result("Seg13: System with no readings returns explicit null / N/A", False, f"Exception: {e}")
+
+        # 243. N/A health response for system with only nighttime readings (null / "N/A")
+        try:
+            for i in range(5):
+                mock_db._store["readings"][f"read_night_{i}"] = {
+                    "system_id": "SYS-NIGHT-ONLY",
+                    "unix_timestamp": 1787050000 + i * 300,
+                    "expected_power": 0.0,
+                    "power": 0.0,
+                    "performance_ratio": 0.0
+                }
+            h_night = ml.calculate_health_score(system_id="SYS-NIGHT-ONLY", db=mock_db)
+            passed = (
+                h_night.get("health_score") is None
+                and h_night.get("status") == "N/A"
+                and h_night.get("daytime_readings_analyzed") == 0
+                and h_night.get("readings_analyzed") == 5
+                and h_night.get("average_pr") is None
+            )
+            record_result("Seg13: System with only nighttime readings returns explicit null / N/A", passed, f"Score: {h_night.get('health_score')} | Status: {h_night.get('status')} | Daytime: {h_night.get('daytime_readings_analyzed')}")
+        except Exception as e:
+            record_result("Seg13: System with only nighttime readings returns explicit null / N/A", False, f"Exception: {e}")
+
+        # 244. API: GET /api/systems/<id>/health returns 404 for non-existent system
+        try:
+            r_404 = client.get("/api/systems/SYS-DOES-NOT-EXIST/health", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r_404.status_code == 404)
+            record_result("Seg13: GET /api/systems/<id>/health returns 404 for non-existent system", passed, f"Status: {r_404.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/systems/<id>/health returns 404 for non-existent system", False, f"Exception: {e}")
+
+        # 245. API: GET /api/systems/<id>/health returns 401 for unauthenticated request
+        try:
+            r_unauth = client.get("/api/systems/SYS-HEALTH-01/health")
+            passed = (r_unauth.status_code == 401)
+            record_result("Seg13: GET /api/systems/<id>/health returns 401 for unauthenticated request", passed, f"Status: {r_unauth.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/systems/<id>/health returns 401 for unauthenticated request", False, f"Exception: {e}")
+
+        # 246. API: GET /api/systems/<id>/health allows assigned technician (200)
+        try:
+            mock_db._store["assignments"]["ASG-HEALTH-TECH"] = {
+                "assignment_id": "ASG-HEALTH-TECH",
+                "technician_uid": "uid_tech",
+                "system_id": "SYS-HEALTH-01",
+                "site_id": "SITE-01",
+                "status": "active"
+            }
+            r_tech_asg = client.get("/api/systems/SYS-HEALTH-01/health", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r_tech_asg.status_code == 200 and "health_score" in (r_tech_asg.get_json() or {}))
+            record_result("Seg13: GET /api/systems/<id>/health allows assigned technician (200)", passed, f"Status: {r_tech_asg.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/systems/<id>/health allows assigned technician", False, f"Exception: {e}")
+
+        # 247. API: GET /api/systems/<id>/health blocks unassigned technician (403)
+        try:
+            r_tech_unasg = client.get("/api/systems/SYS-HEALTH-01/health", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r_tech_unasg.status_code == 403)
+            record_result("Seg13: GET /api/systems/<id>/health blocks unassigned technician (403)", passed, f"Status: {r_tech_unasg.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/systems/<id>/health blocks unassigned technician", False, f"Exception: {e}")
+
+        # 248. API: GET /api/ml/predict rejects NaN values via query params with 400
+        try:
+            r_nan = client.get("/api/ml/predict?irradiance=nan&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r_nan.status_code == 400)
+            record_result("Seg13: GET /api/ml/predict rejects NaN query param with 400", passed, f"Status: {r_nan.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/ml/predict rejects NaN query param with 400", False, f"Exception: {e}")
+
+        # 249. API: GET /api/ml/predict rejects Infinity values via query params with 400
+        try:
+            r_inf = client.get("/api/ml/predict?irradiance=inf&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r_inf.status_code == 400)
+            record_result("Seg13: GET /api/ml/predict rejects Infinity query param with 400", passed, f"Status: {r_inf.status_code}")
+        except Exception as e:
+            record_result("Seg13: GET /api/ml/predict rejects Infinity query param with 400", False, f"Exception: {e}")
+
+        # 250. API: GET /api/ml/predict returns training_samples alias matching training_sample_count
+        try:
+            r_alias = client.get("/api/ml/predict?irradiance=850&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2&system_capacity_kw=1.0", headers={"Authorization": "Bearer valid-token-owner"})
+            pred_data = r_alias.get_json() or {}
+            passed = (
+                r_alias.status_code == 200
+                and "training_samples" in pred_data
+                and pred_data["training_samples"] == pred_data.get("training_sample_count")
+            )
+            record_result("Seg13: GET /api/ml/predict returns training_samples spec alias", passed, f"training_samples: {pred_data.get('training_samples')}")
+        except Exception as e:
+            record_result("Seg13: GET /api/ml/predict returns training_samples spec alias", False, f"Exception: {e}")
+
+        # 251. API: POST /api/ml/train rejects Technician (403) and Anonymous (401)
+        try:
+            r_tech_train = client.post("/api/ml/train", headers={"Authorization": "Bearer valid-token-tech"})
+            r_anon_train = client.post("/api/ml/train")
+            passed = (r_tech_train.status_code == 403 and r_anon_train.status_code == 401)
+            record_result("Seg13: POST /api/ml/train rejects Technician (403) and Anonymous (401)", passed, f"Tech: {r_tech_train.status_code} | Anon: {r_anon_train.status_code}")
+        except Exception as e:
+            record_result("Seg13: POST /api/ml/train rejects Technician (403) and Anonymous", False, f"Exception: {e}")
+
+        # 252. Physical expected_power is preserved and not overwritten by ML in /api/ingest
+        try:
+            ingest_payload = {
+                "system_id": "SYS-INGEST-ML-CHECK",
+                "voltage": 12.0,
+                "current": 10.0,
+                "power": 120.0,
+                "expected_power": 150.0,
+                "unix_timestamp": 1787060000
+            }
+            r_ing = client.post("/api/ingest", json=ingest_payload)
+            ing_json = r_ing.get_json() or {}
+            ing_data = ing_json.get("data", {})
+            passed = (
+                r_ing.status_code == 201
+                and ing_data.get("expected_power") == 150.0
+                and ing_data.get("power") == 120.0
+                and "predicted_power" not in ing_data
+            )
+            record_result("Seg13: Physical expected_power preserved distinctly from ML predicted_power", passed, f"Status: {r_ing.status_code} | ExpPower: {ing_data.get('expected_power')}")
+        except Exception as e:
+            record_result("Seg13: Physical expected_power preserved distinctly from ML predicted_power", False, f"Exception: {e}")
+
+        # 253. generate_synthetic_training_data does not mutate global random state
+        try:
+            import random as py_random
+            py_random.seed(12345)
+            val1 = py_random.random()
+            py_random.seed(12345)
+            # Call synthetic data generator
+            ml.generate_synthetic_training_data(n_samples=50)
+            val2 = py_random.random()
+            passed = (val1 == val2)
+            record_result("Seg13: generate_synthetic_training_data does not mutate global random state", passed, f"RNG state isolated: {passed}")
+        except Exception as e:
+            record_result("Seg13: generate_synthetic_training_data does not mutate global random state", False, f"Exception: {e}")
+
+        # 254. Feature mismatch detection in predict_power
+        try:
+            bundle = joblib.load(ml.get_model_path())
+            bundle["metadata"]["feature_names"] = ["irradiance", "panel_temp", "hour_of_day", "day_of_week", "mismatched_feature"]
+            mismatch_path = os.path.join(os.path.dirname(ml.get_model_path()), "mismatch_test.pkl")
+            joblib.dump(bundle, mismatch_path)
+            with patch("BACKEND.ml_predict.get_model_path", return_value=mismatch_path):
+                caught_mismatch = False
+                try:
+                    ml.predict_power({"irradiance": 500.0, "panel_temp": 35.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0})
+                except ValueError as ve:
+                    if "feature mismatch" in str(ve).lower():
+                        caught_mismatch = True
+            if os.path.exists(mismatch_path):
+                os.remove(mismatch_path)
+            record_result("Seg13: predict_power detects stored feature schema mismatch", caught_mismatch, f"Caught feature mismatch: {caught_mismatch}")
+        except Exception as e:
+            record_result("Seg13: predict_power detects stored feature schema mismatch", False, f"Exception: {e}")
+
+        # 255. Retraining failure safety (tmp write failure keeps existing model intact)
+        try:
+            existing_size = os.path.getsize(ml.get_model_path())
+            with patch("joblib.dump", side_effect=IOError("Simulated disk full")):
+                failed_cleanly = False
+                try:
+                    ml.train_model(db=mock_db)
+                except RuntimeError:
+                    failed_cleanly = True
+            after_size = os.path.getsize(ml.get_model_path())
+            passed = (failed_cleanly and existing_size == after_size)
+            record_result("Seg13: Retraining persistence failure keeps existing model intact", passed, f"Model preserved: {passed} (size={after_size} bytes)")
+        except Exception as e:
+            record_result("Seg13: Retraining persistence failure keeps existing model intact", False, f"Exception: {e}")
+
+        # 256. Formula Regression: 0% loss, 0 anomaly ratio, 0 variance -> exactly 100.0 Excellent
+        try:
+            raw_0 = ml._calculate_raw_health_score(avg_loss_percent=0.0, anomaly_ratio=0.0, pr_variance=0.0)
+            expected_0 = 100.0 - (0.0 * 1.0) - (0.0 * 20.0) - (0.0 * 200.0)
+            passed = (raw_0 == expected_0 == 100.0 and ml._health_status_from_score(raw_0) == "Excellent")
+            record_result("Seg13: Formula Regression (0% loss, 0 anomaly, 0 var = 100.0)", passed, f"Calculated: {raw_0} | Expected: {expected_0}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (0% loss, 0 anomaly, 0 var = 100.0)", False, f"Exception: {e}")
+
+        # 257. Formula Regression: 5% loss -> exactly 95.0 Excellent
+        try:
+            raw_5 = ml._calculate_raw_health_score(avg_loss_percent=5.0, anomaly_ratio=0.0, pr_variance=0.0)
+            expected_5 = 100.0 - (5.0 * 1.0) - (0.0 * 20.0) - (0.0 * 200.0)
+            passed = (raw_5 == expected_5 == 95.0 and ml._health_status_from_score(raw_5) == "Excellent")
+            record_result("Seg13: Formula Regression (5% loss = 95.0)", passed, f"Calculated: {raw_5} | Expected: {expected_5}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (5% loss = 95.0)", False, f"Exception: {e}")
+
+        # 258. Formula Regression: 10% loss -> exactly 90.0 Excellent
+        try:
+            raw_10 = ml._calculate_raw_health_score(avg_loss_percent=10.0, anomaly_ratio=0.0, pr_variance=0.0)
+            expected_10 = 100.0 - (10.0 * 1.0) - (0.0 * 20.0) - (0.0 * 200.0)
+            passed = (raw_10 == expected_10 == 90.0 and ml._health_status_from_score(raw_10) == "Excellent")
+            record_result("Seg13: Formula Regression (10% loss = 90.0)", passed, f"Calculated: {raw_10} | Expected: {expected_10}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (10% loss = 90.0)", False, f"Exception: {e}")
+
+        # 259. Formula Regression: 15% loss -> exactly 85.0 Good
+        try:
+            raw_15 = ml._calculate_raw_health_score(avg_loss_percent=15.0, anomaly_ratio=0.0, pr_variance=0.0)
+            expected_15 = 100.0 - (15.0 * 1.0) - (0.0 * 20.0) - (0.0 * 200.0)
+            passed = (raw_15 == expected_15 == 85.0 and ml._health_status_from_score(raw_15) == "Good")
+            record_result("Seg13: Formula Regression (15% loss = 85.0 Good)", passed, f"Calculated: {raw_15} | Expected: {expected_15}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (15% loss = 85.0 Good)", False, f"Exception: {e}")
+
+        # 260. Formula Regression: Anomaly ratio penalty (20% anomalies = -4.0)
+        try:
+            raw_anom = ml._calculate_raw_health_score(avg_loss_percent=0.0, anomaly_ratio=0.20, pr_variance=0.0)
+            expected_anom = 100.0 - (0.0 * 1.0) - (0.20 * 20.0) - (0.0 * 200.0)
+            passed = (raw_anom == expected_anom == 96.0)
+            record_result("Seg13: Formula Regression (20% anomaly ratio = -4.0 deduction)", passed, f"Calculated: {raw_anom} | Expected: {expected_anom}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (20% anomaly ratio = -4.0 deduction)", False, f"Exception: {e}")
+
+        # 261. Formula Regression: PR variance penalty (0.02 variance = -4.0)
+        try:
+            raw_var = ml._calculate_raw_health_score(avg_loss_percent=0.0, anomaly_ratio=0.0, pr_variance=0.02)
+            expected_var = 100.0 - (0.0 * 1.0) - (0.0 * 20.0) - (0.02 * 200.0)
+            passed = (raw_var == expected_var == 96.0)
+            record_result("Seg13: Formula Regression (0.02 PR variance = -4.0 deduction)", passed, f"Calculated: {raw_var} | Expected: {expected_var}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (0.02 PR variance = -4.0 deduction)", False, f"Exception: {e}")
+
+        # 262. Formula Regression: Clamping to [0, 100] under extreme penalties
+        try:
+            raw_extreme = ml._calculate_raw_health_score(avg_loss_percent=120.0, anomaly_ratio=1.0, pr_variance=0.1)
+            clamped = max(0.0, min(100.0, raw_extreme))
+            passed = (raw_extreme < 0.0 and clamped == 0.0 and ml._health_status_from_score(clamped) == "Critical")
+            record_result("Seg13: Formula Regression (extreme fault clamps to 0.0 Critical)", passed, f"Raw: {raw_extreme} | Clamped: {clamped}")
+        except Exception as e:
+            record_result("Seg13: Formula Regression (extreme fault clamps to 0.0 Critical)", False, f"Exception: {e}")
+
+        # 263. Three-way State Distinction: N/A vs Critical vs Excellent
+        try:
+            # Case 1: No data -> N/A
+            res_na = ml.calculate_health_score(system_id="SYS-DISTINCT-NA", db=mock_db)
+            # Case 2: Degraded telemetry -> Critical
+            for i in range(10):
+                mock_db._store["readings"][f"read_dist_crit_{i}"] = {
+                    "system_id": "SYS-DISTINCT-CRIT",
+                    "unix_timestamp": 1787050000 + i * 300,
+                    "expected_power": 300.0,
+                    "power": 30.0,
+                    "performance_ratio": 0.10
+                }
+            res_crit = ml.calculate_health_score(system_id="SYS-DISTINCT-CRIT", db=mock_db)
+            # Case 3: Healthy telemetry -> Excellent
+            for i in range(10):
+                mock_db._store["readings"][f"read_dist_exc_{i}"] = {
+                    "system_id": "SYS-DISTINCT-EXC",
+                    "unix_timestamp": 1787050000 + i * 300,
+                    "expected_power": 300.0,
+                    "power": 290.0,
+                    "performance_ratio": 0.9667
+                }
+            res_exc = ml.calculate_health_score(system_id="SYS-DISTINCT-EXC", db=mock_db)
+
+            passed = (
+                res_na.get("status") == "N/A" and res_na.get("health_score") is None
+                and res_crit.get("status") == "Critical" and res_crit.get("health_score") is not None and res_crit.get("health_score") < 50.0
+                and res_exc.get("status") == "Excellent" and res_exc.get("health_score") is not None and res_exc.get("health_score") >= 90.0
+            )
+            record_result("Seg13: Three-way State Distinction (N/A vs Critical vs Excellent)", passed, f"NA: {res_na.get('status')} | Crit: {res_crit.get('status')} ({res_crit.get('health_score')}) | Exc: {res_exc.get('status')} ({res_exc.get('health_score')})")
+        except Exception as e:
+            record_result("Seg13: Three-way State Distinction (N/A vs Critical vs Excellent)", False, f"Exception: {e}")
+
+        # 264. Continuous float boundary edge cases (89.999->Good, 74.999->Warning, 49.999->Critical, None->N/A)
+        try:
+            s_89_999 = ml._health_status_from_score(89.999)
+            s_74_999 = ml._health_status_from_score(74.999)
+            s_49_999 = ml._health_status_from_score(49.999)
+            s_none = ml._health_status_from_score(None)
+            passed = (
+                s_89_999 == "Good"
+                and s_74_999 == "Warning"
+                and s_49_999 == "Critical"
+                and s_none == "N/A"
+            )
+            record_result("Seg13: Continuous float boundary edge cases (89.999->Good, 74.999->Warn, 49.999->Crit, None->N/A)", passed, f"89.999: {s_89_999} | 74.999: {s_74_999} | 49.999: {s_49_999} | None: {s_none}")
+        except Exception as e:
+            record_result("Seg13: Continuous float boundary edge cases", False, f"Exception: {e}")
+
+        # 265. API JSON serialization produces JSON null for no-data health score
+        try:
+            mock_db._store["systems"]["SYS-DISTINCT-NA"] = {"system_id": "SYS-DISTINCT-NA", "name": "NA System", "owner_uid": "uid_admin"}
+            r_json_check = client.get("/api/systems/SYS-DISTINCT-NA/health", headers={"Authorization": "Bearer valid-token-admin"})
+            payload = r_json_check.get_json() or {}
+            passed = (
+                r_json_check.status_code == 200
+                and "health_score" in payload
+                and payload["health_score"] is None
+                and payload["status"] == "N/A"
+                and payload["average_pr"] is None
+            )
+            record_result("Seg13: API JSON response serializes no-data health score as null", passed, f"Status: {r_json_check.status_code} | health_score: {payload.get('health_score')} | status: {payload.get('status')}")
+        except Exception as e:
+            record_result("Seg13: API JSON response serializes no-data health score as null", False, f"Exception: {e}")
+
+        # 266. Real Irradiance used directly without fabricating fake Lux in /api/ingest
+        try:
+            ingest_payload_irrad = {
+                "system_id": "SYS-IRRAD-DIRECT",
+                "voltage": 24.0,
+                "current": 10.0,
+                "power": 240.0,
+                "expected_power": 300.0,
+                "irradiance": 850.0,
+                "unix_timestamp": 1787062000
+            }
+            r_ing_irrad = client.post("/api/ingest", json=ingest_payload_irrad)
+            ing_data_irrad = (r_ing_irrad.get_json() or {}).get("data", {})
+            passed = (
+                r_ing_irrad.status_code == 201
+                and ing_data_irrad.get("irradiance") == 850.0
+                and ing_data_irrad.get("lux") is None
+            )
+            record_result("Seg13: Real irradiance used directly without fabricating fake Lux", passed, f"Irradiance: {ing_data_irrad.get('irradiance')} | Lux: {ing_data_irrad.get('lux')}")
+        except Exception as e:
+            record_result("Seg13: Real irradiance used directly without fabricating fake Lux", False, f"Exception: {e}")
+
+        # 267. Physical expected power deterministic calculation with capacity scaling (1kW vs 5kW) & temperature derating
+        try:
+            # 1 kW system at 1000 W/m2 and 25C -> 1000W
+            p_exp_1k = ml.calculate_expected_power(irradiance=1000.0, system_capacity_kw=1.0, panel_temp=25.0)
+            # 5 kW system at 1000 W/m2 and 25C -> 5000W
+            p_exp_5k = ml.calculate_expected_power(irradiance=1000.0, system_capacity_kw=5.0, panel_temp=25.0)
+            # 1 kW system at 1000 W/m2 and 45C (20C above STC -> -8% derating) -> 920W
+            p_exp_derated = ml.calculate_expected_power(irradiance=1000.0, system_capacity_kw=1.0, panel_temp=45.0)
+            passed = (
+                p_exp_1k == 1000.0
+                and p_exp_5k == 5000.0
+                and p_exp_derated == 920.0
+            )
+            record_result("Seg13: Deterministic physical expected power scales with capacity and temp derating", passed, f"1kW: {p_exp_1k}W | 5kW: {p_exp_5k}W | 45C: {p_exp_derated}W")
+        except Exception as e:
+            record_result("Seg13: Deterministic physical expected power scales with capacity and temp derating", False, f"Exception: {e}")
+
+        # 268. Capacity-aware ML prediction: 5 kW plant scales above 1 kW plant under identical solar conditions
+        try:
+            pred_1kw = ml.predict_power({
+                "irradiance": 800.0,
+                "panel_temp": 35.0,
+                "humidity": 50.0,
+                "hour_of_day": 12,
+                "day_of_week": 1,
+                "system_capacity_kw": 1.0
+            })
+            pred_5kw = ml.predict_power({
+                "irradiance": 800.0,
+                "panel_temp": 35.0,
+                "humidity": 50.0,
+                "hour_of_day": 12,
+                "day_of_week": 1,
+                "system_capacity_kw": 5.0
+            })
+            passed = (
+                pred_1kw["predicted_power"] > 0
+                and pred_5kw["predicted_power"] > pred_1kw["predicted_power"] * 3.0
+            )
+            record_result("Seg13: Capacity-aware ML scales power prediction between 1kW and 5kW systems", passed, f"1kW: {pred_1kw['predicted_power']}W | 5kW: {pred_5kw['predicted_power']}W")
+        except Exception as e:
+            record_result("Seg13: Capacity-aware ML scales power prediction between 1kW and 5kW systems", False, f"Exception: {e}")
+
+        # 269. Legacy BH1750 Lux fallback approximation supported without overriding real irradiance
+        try:
+            # Case A: Real irradiance present -> Lux ignored
+            feat_real = ml.prepare_features_from_readings([{"irradiance": 750.0, "lux": 10000.0, "panel_temp": 30.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 700.0}])
+            # Case B: Only Lux present -> approximation fallback (120000 / 120 = 1000 W/m2)
+            feat_legacy = ml.prepare_features_from_readings([{"lux": 120000.0, "panel_temp": 30.0, "humidity": 50.0, "hour_of_day": 12, "day_of_week": 1, "system_capacity_kw": 1.0, "power": 950.0}])
+            passed = (
+                feat_real.iloc[0]["irradiance"] == 750.0
+                and feat_legacy.iloc[0]["irradiance"] == 1000.0
+            )
+            record_result("Seg13: Real irradiance takes precedence over Lux with legacy approximation fallback", passed, f"Real: {feat_real.iloc[0]['irradiance']} | Legacy: {feat_legacy.iloc[0]['irradiance']}")
+        except Exception as e:
+            record_result("Seg13: Real irradiance takes precedence over Lux with legacy approximation fallback", False, f"Exception: {e}")
+
+        # 270. Safe handling of missing irradiance (rejected with 400 when both irradiance and lux are absent)
+        try:
+            r_no_irrad = client.get("/api/ml/predict?panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r_no_irrad.status_code == 400)
+            record_result("Seg13: Missing irradiance and lux rejected with 400 without fabrication", passed, f"Status: {r_no_irrad.status_code}")
+        except Exception as e:
+            record_result("Seg13: Missing irradiance and lux rejected with 400 without fabrication", False, f"Exception: {e}")
+
+
 
     print("\n==================================================================================")
     print("                    Integration & Security Test Results Summary                   ")

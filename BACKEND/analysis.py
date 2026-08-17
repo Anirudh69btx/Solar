@@ -125,13 +125,21 @@ def detect_anomalies(
     return is_anomaly, avg_pr, anomalous_readings
 
 
-def has_active_alert(db, alert_type: str = "performance_drop") -> Optional[Dict]:
+def has_active_alert(
+    db,
+    alert_type: str = "performance_drop",
+    system_id: Optional[str] = None,
+    max_age_seconds: Optional[int] = None
+) -> Optional[Dict]:
     """
-    Checks if an active alert for the given type already exists in Firestore.
+    Checks if an active alert for the given type and system already exists in Firestore.
 
     Args:
         db: Firestore client handle.
         alert_type (str): Type of alert to query.
+        system_id (str, optional): System identifier to scope the duplicate check.
+        max_age_seconds (int, optional): If provided, only matches active alerts created
+                                         within this time window (e.g. 3600 for 1 hour).
 
     Returns:
         Optional[Dict]: Active alert document dict with ID if found, else None.
@@ -142,14 +150,39 @@ def has_active_alert(db, alert_type: str = "performance_drop") -> Optional[Dict]
             alerts_ref
             .where(filter=FieldFilter("active", "==", True))
             .where(filter=FieldFilter("type", "==", alert_type))
-            .limit(1)
         )
         docs = list(query.stream())
 
-        if docs:
-            alert_data = docs[0].to_dict()
-            alert_data["id"] = docs[0].id
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        for doc in docs:
+            alert_data = doc.to_dict() or {}
+            alert_data["id"] = doc.id
+
+            # If system_id is provided, ensure it matches
+            if system_id is not None:
+                doc_sys_id = alert_data.get("system_id")
+                if doc_sys_id != system_id:
+                    continue
+
+            # If max_age_seconds is provided, verify timestamp age
+            if max_age_seconds is not None:
+                alert_ts = alert_data.get("unix_timestamp")
+                if alert_ts is None and alert_data.get("timestamp"):
+                    try:
+                        alert_dt = datetime.fromisoformat(str(alert_data["timestamp"]).replace("Z", "+00:00"))
+                        alert_ts = int(alert_dt.timestamp())
+                    except Exception:
+                        alert_ts = None
+
+                if alert_ts is not None:
+                    age_seconds = now_ts - alert_ts
+                    if age_seconds > max_age_seconds:
+                        # Alert is older than the duplicate suppression window
+                        continue
+
             return alert_data
+
         return None
     except Exception as e:
         print(f"[Analysis ERROR] Error checking active alert: {e}", file=sys.stderr)
@@ -162,7 +195,12 @@ def create_alert(
     message: str,
     reading_id: str,
     lost_energy_kwh: float = 0.0,
-    avg_pr: float = 0.0
+    avg_pr: float = 0.0,
+    system_id: Optional[str] = None,
+    site_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    threshold: float = PR_THRESHOLD,
+    max_duplicate_age_seconds: Optional[int] = 3600
 ) -> Tuple[str, bool]:
     """
     Creates an alert document in Firestore if no active alert of the same type already exists.
@@ -171,11 +209,17 @@ def create_alert(
         - timestamp (str ISO format)
         - unix_timestamp (int)
         - type (str, e.g. "performance_drop")
+        - severity (str: "warning" | "critical")
+        - performance_ratio (float)
+        - average_pr (float)
+        - threshold (float)
+        - status (str: "active")
+        - active (bool: True)
         - message (str)
         - reading_id (str)
         - lost_energy_kwh (float)
-        - average_pr (float)
-        - active (bool: True)
+        - system_id (str, optional)
+        - site_id (str, optional)
 
     Args:
         db: Firestore client handle.
@@ -184,34 +228,55 @@ def create_alert(
         reading_id (str): ID of the latest anomalous reading.
         lost_energy_kwh (float): Calculated energy loss in kWh.
         avg_pr (float): Average PR during anomaly period.
+        system_id (str, optional): Solar system identifier.
+        site_id (str, optional): Site identifier if associated.
+        severity (str, optional): Alert severity ("warning" | "critical"). Auto-derived if None.
+        threshold (float): PR threshold breached (default: 0.70).
+        max_duplicate_age_seconds (int, optional): Window for duplicate suppression (default: 3600s).
 
     Returns:
         Tuple[str, bool]: (alert_id, is_newly_created)
     """
     try:
         # Prevent duplicate alerts for the same ongoing fault episode
-        existing_alert = has_active_alert(db, alert_type)
+        existing_alert = has_active_alert(
+            db=db,
+            alert_type=alert_type,
+            system_id=system_id,
+            max_age_seconds=max_duplicate_age_seconds
+        )
         if existing_alert:
-            print(f"[Alert System] Active '{alert_type}' alert already exists ({existing_alert['id']}). Skipping duplicate creation.")
+            sys_info = f" for system '{system_id}'" if system_id else ""
+            print(f"[Alert System] Active '{alert_type}' alert already exists ({existing_alert['id']}){sys_info}. Skipping duplicate creation.")
             return existing_alert["id"], False
+
+        if severity is None:
+            severity = "warning" if avg_pr >= 0.50 else "critical"
 
         now = datetime.now(timezone.utc)
         alert_doc = {
             "timestamp": now.isoformat(),
             "unix_timestamp": int(now.timestamp()),
             "type": alert_type,
+            "severity": severity,
+            "performance_ratio": round(avg_pr, 4),
+            "average_pr": round(avg_pr, 4),
+            "threshold": round(threshold, 4),
+            "status": "active",
+            "active": True,
             "message": message,
             "reading_id": reading_id,
             "lost_energy_kwh": round(lost_energy_kwh, 4),
-            "average_pr": round(avg_pr, 4),
-            "active": True
+            "system_id": system_id,
+            "site_id": site_id
         }
 
         alerts_ref = db.collection(COLLECTION_ALERTS)
         new_doc_ref = alerts_ref.document()
         new_doc_ref.set(alert_doc)
         
-        print(f"[Alert System] Created NEW active alert: {new_doc_ref.id} | Message: {message}")
+        sys_info = f" [System: {system_id}]" if system_id else ""
+        print(f"[Alert System] Created NEW active alert: {new_doc_ref.id}{sys_info} | Severity: {severity} | Message: {message}")
         return new_doc_ref.id, True
 
     except Exception as e:
@@ -219,13 +284,19 @@ def create_alert(
         raise e
 
 
-def resolve_active_alerts(db, alert_type: str = "performance_drop") -> int:
+def resolve_active_alerts(
+    db,
+    alert_type: str = "performance_drop",
+    system_id: Optional[str] = None
+) -> int:
     """
-    Marks active alerts of a given type as resolved (active = False) when system recovers.
+    Marks active alerts of a given type as resolved (active = False, status = "resolved")
+    when system performance recovers.
 
     Args:
         db: Firestore client handle.
         alert_type (str): Alert type to resolve.
+        system_id (str, optional): Solar system identifier to resolve alerts for.
 
     Returns:
         int: Number of resolved alerts.
@@ -241,12 +312,21 @@ def resolve_active_alerts(db, alert_type: str = "performance_drop") -> int:
         resolved_count = 0
 
         for doc in docs:
-            doc.reference.update({
-                "active": False,
-                "resolved_at": datetime.now(timezone.utc).isoformat()
-            })
+            doc_data = doc.to_dict() or {}
+            if system_id is not None and doc_data.get("system_id") != system_id:
+                continue
+
+            # Update document reference
+            ref = getattr(doc, "reference", None)
+            if ref and hasattr(ref, "update"):
+                ref.update({
+                    "active": False,
+                    "status": "resolved",
+                    "resolved_at": datetime.now(timezone.utc).isoformat()
+                })
             resolved_count += 1
-            print(f"[Alert System] Resolved alert {doc.id} as system performance recovered.")
+            sys_info = f" (system: {system_id})" if system_id else ""
+            print(f"[Alert System] Resolved alert {doc.id}{sys_info} as system performance recovered.")
 
         return resolved_count
     except Exception as e:

@@ -26,6 +26,7 @@ from BACKEND.sites import sites_bp
 from BACKEND.systems import systems_bp
 from BACKEND.assignments import assignments_bp
 from BACKEND.reports import reports_bp
+from BACKEND.ml_predict import ml_bp
 
 # Configure backend logging
 logging.basicConfig(
@@ -52,6 +53,9 @@ app.register_blueprint(assignments_bp)
 
 # Register Solar Reports Blueprint (Segment 9)
 app.register_blueprint(reports_bp)
+
+# Register Machine Learning & Health Score Blueprint (Segment 13)
+app.register_blueprint(ml_bp)
 
 COLLECTION_READINGS = "readings"
 COLLECTION_ALERTS = "alerts"
@@ -167,17 +171,18 @@ def ingest_reading():
             timestamp_str = now_dt.isoformat()
             unix_ts = int(now_dt.timestamp())
 
-        # Handle Lux / Irradiance conversion if specified
+        # Handle Real Irradiance (W/m²) vs Auxiliary Lux
         irradiance = payload.get("irradiance")
         lux = payload.get("lux")
         if irradiance is None and lux is not None:
+            # Legacy/approximation fallback: BH1750 Lux converted to approximate irradiance (W/m²)
             try:
                 irradiance = round(float(lux) / 120.0, 2)
             except (ValueError, TypeError):
                 irradiance = 0.0
         elif irradiance is not None:
             try:
-                irradiance = float(irradiance)
+                irradiance = round(float(irradiance), 2)
             except (ValueError, TypeError):
                 irradiance = 0.0
         else:
@@ -200,7 +205,7 @@ def ingest_reading():
             "expected_power": round(expected_power, 2),
             "performance_ratio": pr,
             "irradiance": round(irradiance, 2),
-            "lux": round(float(lux), 2) if lux is not None else round(irradiance * 120.0, 2),
+            "lux": round(float(lux), 2) if lux is not None else None,
             "temperature_ambient": float(payload.get("temperature_ambient", 25.0)),
             "temperature_panel": float(payload.get("temperature_panel", 35.0)),
             "humidity": float(payload.get("humidity", 50.0)),
@@ -208,6 +213,34 @@ def ingest_reading():
             "rain": float(payload.get("rain", 0.0)),
             "fault_injected": bool(payload.get("fault_injected", False))
         }
+
+        # Preserve optional multi-system identifiers and edge telemetry fields
+        if "system_id" in payload and payload["system_id"] is not None:
+            cleaned_reading["system_id"] = str(payload["system_id"])
+        if "device_id" in payload and payload["device_id"] is not None:
+            cleaned_reading["device_id"] = str(payload["device_id"])
+        if "site_id" in payload and payload["site_id"] is not None:
+            cleaned_reading["site_id"] = str(payload["site_id"])
+        if "energy" in payload and payload["energy"] is not None:
+            try:
+                cleaned_reading["energy"] = round(float(payload["energy"]), 4)
+            except (ValueError, TypeError):
+                pass
+        if "lost_generation" in payload and payload["lost_generation"] is not None:
+            try:
+                cleaned_reading["lost_generation"] = round(float(payload["lost_generation"]), 4)
+            except (ValueError, TypeError):
+                pass
+        if "fault_detected" in payload:
+            cleaned_reading["fault_detected"] = bool(payload["fault_detected"])
+        if "fault_type" in payload and payload["fault_type"] is not None:
+            cleaned_reading["fault_type"] = str(payload["fault_type"])
+        if "performance_status" in payload and payload["performance_status"] is not None:
+            cleaned_reading["performance_status"] = str(payload["performance_status"])
+        if "data_valid" in payload:
+            cleaned_reading["data_valid"] = bool(payload["data_valid"])
+        if "sensor_fault" in payload:
+            cleaned_reading["sensor_fault"] = bool(payload["sensor_fault"])
 
         db = get_db()
         if db is None:
