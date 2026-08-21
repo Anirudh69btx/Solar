@@ -625,22 +625,198 @@ When a solar system has no telemetry, only nighttime readings (`expected_power <
 
 ---
 
-### Testing & Validation (270 / 270 Tests Passed)
+---
 
-Tests 213–270 in `BACKEND/test_backend.py` (58 dedicated Segment 13 tests) validate:
-- Canonical feature schema (`["irradiance", "panel_temp", "hour_of_day", "day_of_week", "humidity"]`) and capacity-normalized target
-- Real irradiance ingested directly without fabricating fake Lux
-- Physical expected power calculation with capacity scaling ($1\text{ kW}$ vs $5\text{ kW}$) and temperature derating ($P_{\text{exp}} \ge 0$)
-- Capacity-aware ML prediction ($5\text{ kW}$ scales appropriately relative to $1\text{ kW}$)
-- Column aliasing (`irradiance_w_m2`, `temperature_panel`, `panel_capacity_watts`), deduplication, UTC timezone parsing
-- Linear Regression training, synthetic fallback flagging, and evaluation metrics (MAE, RMSE, $R^2$)
-- Chronological 80/20 train/test split metadata preservation
-- Atomic model persistence (`model.pkl.tmp` $\to$ `os.replace` $\to$ `model.pkl`) and write-failure recovery
-- Prediction inference with boundary checks, type coercion, and non-negative power clamping
-- Rejection of `NaN`, `Infinity`, nulls, and out-of-bounds query parameters with HTTP 400
-- Formula regression tests ($0\% \to 100.0$, $5\% \to 95.0$, $10\% \to 90.0$, $15\% \to 85.0$, anomaly penalty, variance penalty, clamping)
-- Continuous float boundary classification ($89.999 \to$ Good, $74.999 \to$ Warning, $49.999 \to$ Critical, None $\to$ N/A)
-- Three-way state distinction (N/A vs Critical vs Excellent)
-- Safe N/A response serialization (`health_score: null`) for unread and nighttime-only systems
-- REST API RBAC enforcement (Admin-only training, auth-gated prediction, system-scoped health for Owner, assigned Technician, and Admin)
-- Physical `expected_power` preserved untouched throughout ingestion and analysis pipelines
+## Segment 14: Document & QR Code Management Engine
+
+Provides authenticated, RBAC-protected REST APIs for managing solar PV installation documents (invoices, technical manuals, warranties, site photos, commissioning reports), automated versioning, date-based expiry tracking, immutable audit trails, and deterministic system QR code generation.
+
+### Firestore Collections
+
+1. **`documents` Collection (`DOC-XXXXXXXX`)**:
+   Stores individual document metadata records.
+   ```json
+   {
+     "doc_id": "DOC-A1B2C3D4",
+     "system_id": "SYS-001",
+     "site_id": "SITE-001",
+     "type": "warranty",
+     "file_url": "https://storage.googleapis.com/solar-monitor-1200c.appspot.com/solar-documents/SITE-001/SYS-001/DOC-A1B2C3D4/v1/inverter_warranty.pdf",
+     "storage_path": "solar-documents/SITE-001/SYS-001/DOC-A1B2C3D4/v1/inverter_warranty.pdf",
+     "filename": "inverter_warranty.pdf",
+     "format": "PDF",
+     "file_size": 204800,
+     "version": 1,
+     "issue_date": "2026-01-15",
+     "expiry_date": "2036-01-15",
+     "status": "Active",
+     "metadata": {
+       "vendor": "SolarTech Global",
+       "warranty_term_years": 10
+     },
+     "uploaded_by": "uid_owner",
+     "uploaded_at": "2026-08-21T02:30:00.000000+00:00"
+   }
+   ```
+
+2. **`document_audits` Collection (`AUD-XXXXXXXX`)**:
+   Immutable, append-only audit trail for document lifecycle actions (`upload`, `view`, `download`, `delete`).
+   ```json
+   {
+     "audit_id": "AUD-F8E7D6C5",
+     "action": "download",
+     "doc_id": "DOC-A1B2C3D4",
+     "system_id": "SYS-001",
+     "site_id": "SITE-001",
+     "performed_by": "uid_tech",
+     "performed_at": "2026-08-21T02:35:00.000000+00:00",
+     "details": {
+       "filename": "inverter_warranty.pdf"
+     }
+   }
+   ```
+
+---
+
+### REST API Endpoints
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/api/documents/upload` | Owner (own system/site) / Admin | Upload file binary via `multipart/form-data` or register reference. Validates magic bytes, MIME, 50MB size limit, and system/site ownership. Generates server-controlled Storage path. |
+| `GET` | `/api/systems/<system_id>/documents` | Owner / Assigned Tech / Admin | List all documents for a solar system. Supports `?type=` and `?status=` filters. Dynamically computes expiry status. |
+| `GET` | `/api/sites/<site_id>/documents` | Owner / Assigned Tech / Admin | List documents for a site. Supports `?scope=site\|all\|systems`, `?type=`, `?status=`. |
+| `GET` | `/api/documents/<doc_id>` | Owner / Assigned Tech / Admin | Retrieve document metadata. Verifies system/site authorization and records `VIEW` audit. |
+| `GET` | `/api/documents/<doc_id>/file` | Owner / Assigned Tech / Admin | Secure file download / short-lived signed access link. Verifies authorization and records `DOWNLOAD` audit. |
+| `DELETE` | `/api/documents/<doc_id>` | Owner (own system/site) / Admin | Delete document metadata and delete Cloud Storage object. Records `DELETE` audit. |
+| `GET` | `/api/systems/<system_id>/qr` | Owner / Assigned Tech / Admin | Generate deterministic QR code image encoding restricted route `/qr-access/<system_id>`. |
+| `GET` | `/api/qr-access/<system_id>` | Public (Unauthenticated) | QR Access Portal landing. Returns safe, minimal system identifier with zero private telemetry. |
+| `GET` | `/api/qr-access/<system_id>/workspace` | Owner / Assigned Tech / Admin | Restricted field workspace with role-specific limited capabilities for the scanned system. |
+
+---
+
+### RBAC Authorization Matrix
+
+| Operation | Owner | Technician | Admin |
+|:---|:---:|:---:|:---:|
+| **Upload Document (System or Site)** | Own systems / sites only | 403 Forbidden | Any system or site |
+| **List Documents (System or Site)** | Own systems / sites only | Assigned systems / sites only | Any system or site |
+| **Get Document Metadata** | Own systems / sites only | Assigned systems / sites only | Any system or site |
+| **Download Document File** | Own systems / sites only | Assigned systems / sites only | Any system or site |
+| **Delete Document** | Own systems / sites only | 403 Forbidden | Any system or site |
+| **Generate QR Image (API)** | Own systems only | Assigned systems only | Any system |
+| **Access QR Landing Portal** | Public (Safe minimal data) | Public (Safe minimal data) | Public (Safe minimal data) |
+| **Access QR System Workspace** | Own system summary & docs | Assigned maintenance & read-only docs | Full management workspace |
+
+---
+
+### Cloud Storage Scheme & File Security
+
+1. **Storage Path Scheme**:
+   - System-level: `solar-documents/<site_id>/<system_id>/<doc_id>/v<version>/<sanitized_filename>`
+   - Site-level: `solar-documents/<site_id>/SITE_LEVEL/<doc_id>/v<version>/<sanitized_filename>`
+2. **File Validation & Magic Bytes**:
+   - PDF: Magic bytes check `b"%PDF-"`
+   - PNG: Magic bytes check `b"\x89PNG\r\n\x1a\n"`
+   - JPG/JPEG: Magic bytes check `b"\xff\xd8\xff"`
+   - Empty files (0 bytes) rejected with 400 Bad Request.
+   - Files $> 50\text{ MB}$ rejected with 400 Bad Request.
+   - Path traversal in filenames (e.g. `../../etc/passwd.pdf`) stripped and sanitized safely.
+3. **Secure File Access**:
+   - Storage buckets are private by default (no permanently public bucket permissions).
+   - Downloads require authentication and server-side RBAC validation.
+   - Generates short-lived v4 signed URLs (15-minute expiration) or streams via authenticated proxy.
+
+---
+
+### QR Code Architecture & Role-Based Router Model
+
+> [!IMPORTANT]
+> **Role-Based Router Architecture**:
+> - **QR Generator API**: `GET /api/systems/<system_id>/qr` (Backend API used by authorized users to obtain the QR PNG image).
+> - **QR Encoded Destination**: `<public_base_url>/qr-access/<system_id>` (Destination encoded INSIDE the QR code for field scanning).
+>
+> **QR Scan Flow & Role-Based Routing**:
+> 1. Physical QR scan opens `/qr-access/<system_id>`.
+> 2. The portal displays minimal public information (`system_id`, portal title, role selection options).
+> 3. User selects intended role context and logs in with Firebase credentials.
+> 4. **Role Selection is NOT Authorization**: The server validates the user's authentic Firebase role from their Firestore profile and checks system/site ownership or assignment. If a Technician selects "Admin", the backend returns 403 Forbidden.
+> 5. **Role-Based Routing Decision**:
+>    - **User / Owner**: Routed to the restricted system QR workspace (`/qr-access/<system_id>/workspace`), **strictly VIEW-ONLY** (limited summary, performance, documents, no management).
+>    - **Technician**: Routed to the restricted technician QR workspace (`/qr-access/<system_id>/workspace`), **strictly VIEW-ONLY** (field maintenance, diagnostics, alerts, read-only documents, no upload/delete/edit).
+>    - **Admin**: **Redirected to the Main Application Admin Dashboard** (`/admin/dashboard?system_id=<system_id>`) with **FULL EXISTING ADMIN POWERS** (system edit, document upload/delete, technician assignments, system configuration). Admin is NOT placed in the restricted view-only workspace.
+
+---
+
+---
+
+## 15. Segment 15 — Admin Panel APIs Specification & Guide
+
+### Overview
+Segment 15 delivers a centralized, hardened, role-protected administrative API surface (`BACKEND/admin_panel.py`). All 16 endpoints are strictly locked down to administrators via `@require_auth` and `@require_role("admin")`.
+
+### REST API Endpoints (Admin Only)
+
+| Method | Endpoint | Query Params / Payload | Description |
+|--------|----------|------------------------|-------------|
+| `GET` | `/api/admin/stats` | — | Platform-wide overview metrics: user count by role, site count, system count, active assignments, active alerts, total documents. |
+| `GET` | `/api/admin/users` | `role`, `page`, `per_page` | Paginated listing of all registered users across the platform. |
+| `GET` | `/api/admin/users/<uid>` | — | Fetch single user profile by Firebase UID. |
+| `PUT` | `/api/admin/users/<uid>` | `{"name": "...", "role": "..."}` | Update user name or role. Protected by zero-admin guard (cannot demote last remaining admin). |
+| `DELETE` | `/api/admin/users/<uid>` | — | Soft-disable user account (`disabled: true`). Protected by self-disable guard and zero-admin guard. |
+| `GET` | `/api/admin/sites` | `owner_uid`, `page`, `per_page` | Paginated listing of all solar sites with dynamically computed `system_count`. |
+| `GET` | `/api/admin/systems` | `owner_uid`, `site_id`, `page`, `per_page` | Paginated listing of all solar installations platform-wide. |
+| `GET` | `/api/admin/assignments` | `status`, `technician_uid`, `system_id`, `site_id`, `page`, `per_page` | Paginated listing of technician assignments across all systems and sites. |
+| `DELETE` | `/api/admin/assignments/<asg_id>` | — | Hard-delete a technician assignment record. Audited to `document_audits`. |
+| `GET` | `/api/admin/alerts` | `active_only`, `system_id`, `page`, `per_page` | Paginated listing of platform alerts. |
+| `PUT` | `/api/admin/alerts/<alert_id>` | `{"active": false}` | Resolve alert. Sets `resolved_by` to admin UID and `resolved_at` timestamp. |
+| `GET` | `/api/admin/documents` | `system_id`, `site_id`, `doc_type`, `page`, `per_page` | Paginated listing of all documents across all systems/sites. |
+| `GET` | `/api/admin/audit-log` | `system_id`, `action`, `performed_by`, `page`, `per_page` | Paginated audit trail covering document lifecycle and administrative operations. |
+| `GET` | `/api/admin/readings` | `system_id`, `page`, `per_page` | Paginated listing of telemetry readings across all systems (or filtered), ordered newest first. |
+| `GET` | `/api/admin/reports/summary` | — | Platform-level performance & generation KPIs: total generation, expected generation, lost energy, average PR, and health. |
+| `GET` | `/api/admin/health` | `sort`, `page`, `per_page` | Platform-wide health monitoring dashboard across all solar systems (sortable lowest/highest). |
+
+### Security & Safety Guards
+1. **Strict Admin Lockdown**: All endpoints require Firebase ID token with role `admin`. Non-admin requests (`owner`, `technician`) return `403 Forbidden`. Unauthenticated requests return `401 Unauthorized`.
+2. **Self-Disable Guard**: Admin cannot disable their own account (`DELETE /api/admin/users/<own_uid>` -> `403 Forbidden`).
+3. **Zero-Admin Guard**: Cannot demote or disable the last remaining admin on the platform (`403 Forbidden`).
+4. **Immutable Audit Logging**: Administrative updates, disables, assignment deletions, and alert resolutions are logged to `document_audits`.
+5. **Safe Pagination**: All list endpoints default to `page=1`, `per_page=50`, capped at `per_page=200`, with full pagination envelope (`items`, `total`, `page`, `per_page`, `total_pages`).
+
+---
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SOLAR_PUBLIC_BASE_URL` | `https://solar.monitoring.internal` | Public frontend base URL encoded in QR payloads (e.g., `https://field.solarmonitor.com`). |
+| `FIREBASE_STORAGE_BUCKET` | `<project_id>.appspot.com` | Google Cloud / Firebase Storage bucket name for solar documents. |
+| `STORAGE_BUCKET_NAME` | (alias for above) | Optional fallback bucket name. |
+
+---
+
+### Testing & Verification (505 / 505 Tests Passed)
+
+Execute the comprehensive test suite:
+```powershell
+.\venv\Scripts\python.exe BACKEND/test_backend.py --include-ingest
+```
+
+**Results**:
+- **Total Tests Run**: `505`
+- **Passed**: `505`
+- **Failed**: `0`
+- **Baseline Segments 1–13**: 275 tests (100% passing).
+- **Segment 14 Baseline & Hardened**: 155 tests (100% passing).
+- **Segment 15 Admin Panel APIs (Tests 431–505)**: 75 tests (100% passing) covering:
+  - Admin Stats endpoint (`GET /api/admin/stats`): 200 OK, full envelope, accurate aggregation, 403 on non-admin.
+  - User Management (`GET/PUT/DELETE /api/admin/users[/<uid>]`): role filtering, profile retrieval, name & role updates, zero-admin demotion prevention, self-disable protection, 404 handling, 403 RBAC enforcement.
+  - Site & System Oversight (`GET /api/admin/sites`, `GET /api/admin/systems`): dynamic `system_count`, multi-owner visibility, owner/site filtering, 403 on technician/owner.
+  - Assignment Management (`GET/DELETE /api/admin/assignments[/<id>]`): status/tech/system filtering, hard-deletion, audit generation, 403 RBAC enforcement.
+  - Alert Management & Resolution (`GET/PUT /api/admin/alerts[/<id>]`): active/all filtering, resolution with `resolved_by`/`resolved_at` injection, empty payload validation, 403 RBAC enforcement.
+  - Document & Audit Trail Oversight (`GET /api/admin/documents`, `GET /api/admin/audit-log`): cross-system document listing, action/performer/system audit log filtering, 403 RBAC enforcement.
+  - Telemetry Readings (`GET /api/admin/readings`): system filtering, pagination, sorting newest first, 403 on non-admin, 401 unauthenticated.
+  - Reports Summary (`GET /api/admin/reports/summary`): platform-wide generation, expected generation, lost energy, average PR, health aggregation, 403 on non-admin.
+  - Health Monitoring Dashboard (`GET /api/admin/health`): multi-system health scores, `sort=lowest` and `sort=highest` sorting, pagination, 403 on non-admin.
+  - Pagination Engine: standard envelopes, slice validation, boundary clamping (`MAX_PER_PAGE=200`), total pages computation.
+  - Authentication Gates: unauthenticated rejection (401) on all endpoints.
+  - End-to-End Administrative Integration Workflow (Test 490).

@@ -1,0 +1,2445 @@
+openapi: 3.0.3
+info:
+  title: Solar PV Monitoring System API
+  description: |
+    Production REST API for the Solar PV Monitoring System.
+    
+    Provides IoT sensor telemetry ingestion, automated real-time analytics,
+    rule-based chatbot, machine learning regression predictions, multi-site & system management,
+    technician assignment RBAC, document lifecycle with Cloud Storage, secure QR Access Portal,
+    and platform-wide administrative oversight.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000
+    description: Local Development Server
+  - url: https://solar.monitoring.internal
+    description: Production Internal Cluster
+
+tags:
+  - name: Health & Liveness
+    description: Liveness and dependency readiness health checks
+  - name: Authentication & Users
+    description: Firebase Authentication, registration, and user profiles
+  - name: Telemetry & Ingest
+    description: Sensor telemetry ingestion and latest readings
+  - name: Alerts & Engine
+    description: Active alerts querying and manual analysis execution
+  - name: Solar Sites
+    description: Multi-site physical installation hierarchy
+  - name: Solar Systems
+    description: Solar installation CRUD and ownership management
+  - name: Technician Assignments
+    description: Field technician site and system dispatching
+  - name: Solar Reports
+    description: Daily, weekly, and monthly solar generation and PR analytics
+  - name: Machine Learning & Health
+    description: Power prediction regression and system health scoring
+  - name: Documents & Files
+    description: Document lifecycle management, validation, and Cloud Storage
+  - name: QR Code & Access Portal
+    description: Safe field QR generation and restricted QR workspace
+  - name: Admin Panel
+    description: Administrative oversight, global KPIs, users, and audit logs
+  - name: AI Chatbot
+    description: Natural language assistant for telemetry and solar insights
+
+paths:
+  /api/health:
+    get:
+      tags:
+        - Health & Liveness
+      summary: Liveness health check
+      description: Returns server liveness status and UTC timestamp. Does not require authentication.
+      responses:
+        '200':
+          description: Service is alive and healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: Solar Monitoring Backend API
+                  timestamp:
+                    type: string
+                    format: date-time
+                    example: "2026-08-21T18:00:00.000000+00:00"
+
+  /api/health/ready:
+    get:
+      tags:
+        - Health & Liveness
+      summary: Readiness dependency check
+      description: Checks connectivity to Firestore database client.
+      responses:
+        '200':
+          description: Backend dependencies are ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  service:
+                    type: string
+                    example: Solar Monitoring Backend API
+                  database:
+                    type: string
+                    example: connected
+                  timestamp:
+                    type: string
+                    format: date-time
+        '503':
+          description: Database connection unavailable
+
+  /api/readings/latest:
+    get:
+      tags:
+        - Telemetry & Ingest
+      summary: Retrieve latest sensor readings
+      description: Returns recent telemetry readings ordered by timestamp descending.
+      parameters:
+        - name: limit
+          in: query
+          description: Number of readings to fetch (1..200, default 50).
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: List of telemetry readings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TelemetryReading'
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/ingest:
+    post:
+      tags:
+        - Telemetry & Ingest
+      summary: Ingest sensor telemetry reading
+      description: Ingests a new IoT reading, persists it to Firestore, and triggers the performance analysis engine.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestPayload'
+      responses:
+        '201':
+          description: Telemetry reading ingested successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Sensor data ingested successfully
+                  doc_id:
+                    type: string
+                    example: read_1787335200
+                  data:
+                    $ref: '#/components/schemas/TelemetryReading'
+                  analysis:
+                    $ref: '#/components/schemas/AnalysisSummary'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/alerts:
+    get:
+      tags:
+        - Alerts & Engine
+      summary: Retrieve active alerts
+      description: Fetches alerts from the Firestore alerts collection, ordered by timestamp descending.
+      parameters:
+        - name: active_only
+          in: query
+          description: Filter for active alerts only (default true).
+          required: false
+          schema:
+            type: boolean
+            default: true
+      responses:
+        '200':
+          description: List of alerts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Alert'
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/analysis/run:
+    get:
+      tags:
+        - Alerts & Engine
+      summary: Trigger analysis engine on demand (GET)
+      description: Evaluates recent telemetry, detects anomalies (PR < 0.70), and creates/resolves alerts.
+      responses:
+        '200':
+          description: Analysis result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisSummary'
+    post:
+      tags:
+        - Alerts & Engine
+      summary: Trigger analysis engine on demand (POST)
+      responses:
+        '200':
+          description: Analysis result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisSummary'
+
+  /api/chat:
+    get:
+      tags:
+        - AI Chatbot
+      summary: Natural language solar assistant query
+      description: Queries the data-backed chatbot for insights on power generation, PR, yesterday's drops, lost energy, and system health.
+      parameters:
+        - name: query
+          in: query
+          required: true
+          description: Natural language question
+          schema:
+            type: string
+            example: "What is my current power generation?"
+      responses:
+        '200':
+          description: Chatbot answer
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query:
+                    type: string
+                  response:
+                    type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/auth/register:
+    post:
+      tags:
+        - Authentication & Users
+      summary: Public user registration (Owner role strictly)
+      description: Creates a new user in Firebase Authentication and Firestore profile. Self-registration is strictly restricted to role 'owner'. Attempting 'admin' or 'technician' returns 403 Forbidden.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: owner@example.com
+                password:
+                  type: string
+                  format: password
+                  minLength: 6
+                  example: secret123
+                name:
+                  type: string
+                  example: Jane Doe
+                role:
+                  type: string
+                  enum: [owner]
+                  default: owner
+      responses:
+        '201':
+          description: User registered successfully
+        '400':
+          description: Validation error or password too short
+        '403':
+          description: Privilege escalation attempt rejected
+        '409':
+          description: User with email already exists
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/auth/users:
+    post:
+      tags:
+        - Authentication & Users
+      summary: Admin-only user creation
+      description: Allows an authenticated Admin to create technician, admin, or owner accounts.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+                - role
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 6
+                name:
+                  type: string
+                role:
+                  type: string
+                  enum: [owner, technician, admin]
+      responses:
+        '201':
+          description: User created successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/auth/me:
+    get:
+      tags:
+        - Authentication & Users
+      summary: Current user profile
+      description: Returns the authenticated user's profile from Firestore based on the verified Firebase Bearer token.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current user profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/auth/admin-only:
+    get:
+      tags:
+        - Authentication & Users
+      summary: Admin role verification test endpoint
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Welcome message for Admin
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/auth/tech-only:
+    get:
+      tags:
+        - Authentication & Users
+      summary: Technician/Admin role verification test endpoint
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Welcome message for Technician or Admin
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/sites:
+    post:
+      tags:
+        - Solar Sites
+      summary: Create solar site
+      description: Creates a physical site entity. Allowed for Owner (creates for self) and Admin. Technician -> 403 Forbidden.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteCreatePayload'
+      responses:
+        '201':
+          description: Site created successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+    get:
+      tags:
+        - Solar Sites
+      summary: List solar sites
+      description: Returns sites accessible to user (Owner: own sites; Tech: assigned sites; Admin: all sites).
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of sites
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Site'
+
+  /api/sites/{site_id}:
+    get:
+      tags:
+        - Solar Sites
+      summary: Get single solar site
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: site_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Site details
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - Solar Sites
+      summary: Update solar site
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: site_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                site_name:
+                  type: string
+                address:
+                  type: string
+                location:
+                  $ref: '#/components/schemas/Location'
+      responses:
+        '200':
+          description: Site updated successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - Solar Sites
+      summary: Delete solar site
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: site_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Site deleted successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/systems:
+    post:
+      tags:
+        - Solar Systems
+      summary: Create solar system installation
+      description: Creates a solar system record. Allowed for Owner and Admin. Technician -> 403 Forbidden.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SystemCreatePayload'
+      responses:
+        '201':
+          description: System created successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    get:
+      tags:
+        - Solar Systems
+      summary: List solar systems
+      description: Returns systems accessible to authenticated user (Owner: own; Tech: actively assigned; Admin: all).
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of systems
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/System'
+
+  /api/systems/{system_id}:
+    get:
+      tags:
+        - Solar Systems
+      summary: Get single solar system
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: System details
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - Solar Systems
+      summary: Update solar system
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                location:
+                  $ref: '#/components/schemas/Location'
+                installation_date:
+                  type: string
+                  format: date-time
+                panel_capacity_watts:
+                  type: number
+                inverter_type:
+                  type: string
+                components:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Component'
+                qr_code_data:
+                  type: string
+                site_id:
+                  type: string
+      responses:
+        '200':
+          description: System updated successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - Solar Systems
+      summary: Delete solar system (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: System deleted successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/systems/{system_id}/health:
+    get:
+      tags:
+        - Machine Learning & Health
+      summary: Get Solar Health Score for system
+      description: Returns standardized health score (0-100), status ('Excellent', 'Good', 'Warning', 'Critical', 'N/A'), and loss metrics.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: System health analytics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthScoreResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/assignments:
+    post:
+      tags:
+        - Technician Assignments
+      summary: Assign technician to site or system (Admin only)
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - technician_uid
+              properties:
+                technician_uid:
+                  type: string
+                system_id:
+                  type: string
+                site_id:
+                  type: string
+      responses:
+        '201':
+          description: Assignment created successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Active assignment already exists
+    get:
+      tags:
+        - Technician Assignments
+      summary: List technician assignments
+      description: Admin sees all assignments; Technician sees own active assignments; Owner -> 403 Forbidden.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: technician_uid
+          in: query
+          schema:
+            type: string
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: site_id
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of assignments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Assignment'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/assignments/{assignment_id}:
+    delete:
+      tags:
+        - Technician Assignments
+      summary: Delete technician assignment (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: assignment_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Assignment deleted successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/reports/daily:
+    get:
+      tags:
+        - Solar Reports
+      summary: Daily solar performance report
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: date
+          in: query
+          required: true
+          description: Date in YYYY-MM-DD format
+          schema:
+            type: string
+            example: "2026-08-21"
+        - name: system_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Daily report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResponse'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/reports/weekly:
+    get:
+      tags:
+        - Solar Reports
+      summary: Weekly/Date-range solar performance report
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          required: true
+          schema:
+            type: string
+            example: "2026-08-15"
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            example: "2026-08-21"
+        - name: system_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Weekly report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResponse'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/reports/monthly:
+    get:
+      tags:
+        - Solar Reports
+      summary: Monthly solar performance report
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: month
+          in: query
+          required: true
+          description: Month in YYYY-MM format
+          schema:
+            type: string
+            example: "2026-08"
+        - name: system_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Monthly report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportResponse'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/ml/train:
+    post:
+      tags:
+        - Machine Learning & Health
+      summary: Train ML regression model (Admin only)
+      description: Trains capacity-normalized linear regression model with chronological 80/20 train/test split.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Model trained successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/ml/predict:
+    get:
+      tags:
+        - Machine Learning & Health
+      summary: Predict solar power generation
+      description: Computes ML prediction from environmental parameters.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: irradiance
+          in: query
+          required: false
+          schema:
+            type: number
+            example: 850.0
+        - name: lux
+          in: query
+          required: false
+          description: Auxiliary lux fallback if irradiance is omitted
+          schema:
+            type: number
+        - name: panel_temp
+          in: query
+          required: true
+          schema:
+            type: number
+            example: 42.5
+        - name: humidity
+          in: query
+          required: true
+          schema:
+            type: number
+            example: 45.0
+        - name: hour_of_day
+          in: query
+          required: true
+          schema:
+            type: integer
+            example: 13
+        - name: day_of_week
+          in: query
+          required: true
+          schema:
+            type: integer
+            example: 4
+        - name: system_capacity_kw
+          in: query
+          required: false
+          schema:
+            type: number
+            default: 1.0
+            example: 5.0
+      responses:
+        '200':
+          description: Prediction response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PredictionResponse'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Model not trained yet
+        '500':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/documents/upload:
+    post:
+      tags:
+        - Documents & Files
+      summary: Upload document metadata & binary file
+      description: Uploads document binary to Firebase Cloud Storage, validates magic bytes, and records metadata + audit log in Firestore.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - type
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                system_id:
+                  type: string
+                site_id:
+                  type: string
+                type:
+                  type: string
+                  enum: [invoice, manual, warranty, photo, commissioning_report, site_insurance, site_agreement, site_blueprint, site_permit, site_safety, contract, other]
+                format:
+                  type: string
+                  enum: [PDF, JPG, JPEG, PNG]
+                issue_date:
+                  type: string
+                  format: date
+                expiry_date:
+                  type: string
+                  format: date
+                metadata:
+                  type: string
+                  description: JSON-encoded metadata object
+          application/json:
+            schema:
+              type: object
+              required:
+                - type
+                - filename
+                - file_url
+              properties:
+                system_id:
+                  type: string
+                site_id:
+                  type: string
+                type:
+                  type: string
+                filename:
+                  type: string
+                format:
+                  type: string
+                file_url:
+                  type: string
+                file_size:
+                  type: integer
+                issue_date:
+                  type: string
+                expiry_date:
+                  type: string
+                metadata:
+                  type: object
+      responses:
+        '201':
+          description: Document uploaded and registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                  document:
+                    $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/systems/{system_id}/documents:
+    get:
+      tags:
+        - Documents & Files
+      summary: List documents for a system
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [Active, Expiring Soon, Expired]
+      responses:
+        '200':
+          description: System documents
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/sites/{site_id}/documents:
+    get:
+      tags:
+        - Documents & Files
+      summary: List documents for a site
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: site_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: scope
+          in: query
+          description: "'site' (default), 'all', or 'systems'"
+          schema:
+            type: string
+            default: site
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Site documents
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/documents/{doc_id}:
+    get:
+      tags:
+        - Documents & Files
+      summary: Get document metadata
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - Documents & Files
+      summary: Delete document
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document deleted successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/documents/{doc_id}/file:
+    get:
+      tags:
+        - Documents & Files
+      summary: Securely download document binary or get signed access URL
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+        - name: signed
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document binary stream or signed URL reference
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/systems/{system_id}/qr:
+    get:
+      tags:
+        - QR Code & Access Portal
+      summary: Generate system QR code
+      description: Returns a QR image encoding the restricted portal route /qr-access/{system_id}.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [png, json, base64]
+            default: png
+      responses:
+        '200':
+          description: PNG binary or JSON payload with base64 data URI
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/qr-access/{system_id}:
+    get:
+      tags:
+        - QR Code & Access Portal
+      summary: Unauthenticated QR portal landing
+      description: Public landing providing minimal, safe portal metadata for physical scanner users before login.
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: QR access portal landing metadata
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/qr-access/{system_id}/workspace:
+    get:
+      tags:
+        - QR Code & Access Portal
+      summary: Authenticated restricted QR workspace
+      description: Derives verified role from server-side profile. Owner/Technician get restricted view-only workspace for scanned system; Admin is routed to main application Admin dashboard with full management powers.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: intended_role
+          in: query
+          description: UI role selection intent (cannot elevate privileges)
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Role-specific restricted workspace
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/qr-access/{system_id}/route:
+    get:
+      tags:
+        - QR Code & Access Portal
+      summary: Route QR access request (GET)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: intended_role
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Routing instruction and target URL
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    post:
+      tags:
+        - QR Code & Access Portal
+      summary: Route QR access request (POST)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                intended_role:
+                  type: string
+      responses:
+        '200':
+          description: Routing instruction and target URL
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/stats:
+    get:
+      tags:
+        - Admin Panel
+      summary: Platform-wide overview statistics (Admin only)
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Platform statistics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminStats'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/users:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all users (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: role
+          in: query
+          schema:
+            type: string
+            enum: [owner, technician, admin]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+      responses:
+        '200':
+          description: Paginated users envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedEnvelope'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/users/{uid}:
+    get:
+      tags:
+        - Admin Panel
+      summary: Get user profile by UID (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+        - Admin Panel
+      summary: Update user name or role (Admin only)
+      description: Protected by zero-admin guard (cannot demote the last remaining admin).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                role:
+                  type: string
+                  enum: [owner, technician, admin]
+      responses:
+        '200':
+          description: User updated successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+        - Admin Panel
+      summary: Soft-disable user account (Admin only)
+      description: Protected by self-guard (admin cannot disable self) and zero-admin guard.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: uid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User account disabled successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/sites:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all sites platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: owner_uid
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated sites envelope with system counts
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/systems:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all systems platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: owner_uid
+          in: query
+          schema:
+            type: string
+        - name: site_id
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated systems envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/assignments:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all assignments platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: technician_uid
+          in: query
+          schema:
+            type: string
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: site_id
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated assignments envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/assignments/{asg_id}:
+    delete:
+      tags:
+        - Admin Panel
+      summary: Hard-delete assignment (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: asg_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Assignment deleted successfully
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/alerts:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all alerts platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: active_only
+          in: query
+          schema:
+            type: string
+            default: "true"
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated alerts envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/alerts/{alert_id}:
+    put:
+      tags:
+        - Admin Panel
+      summary: Resolve or update alert (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: alert_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                active:
+                  type: boolean
+      responses:
+        '200':
+          description: Alert updated successfully
+        '400':
+          $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/documents:
+    get:
+      tags:
+        - Admin Panel
+      summary: List all documents platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: site_id
+          in: query
+          schema:
+            type: string
+        - name: doc_type
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated documents envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/audit-log:
+    get:
+      tags:
+        - Admin Panel
+      summary: List platform audit log (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: performed_by
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated audit log envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/readings:
+    get:
+      tags:
+        - Admin Panel
+      summary: List telemetry readings platform-wide (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: system_id
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated readings envelope
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/reports/summary:
+    get:
+      tags:
+        - Admin Panel
+      summary: Platform-wide KPI and generation summary (Admin only)
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Summary KPIs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminReportsSummary'
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+  /api/admin/health:
+    get:
+      tags:
+        - Admin Panel
+      summary: Platform-wide multi-system health scores (Admin only)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [lowest, highest, name]
+            default: lowest
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated system health list
+        '401':
+          $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Firebase ID Token acquired from Firebase Client Authentication SDK.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          example: Unauthorized
+        message:
+          type: string
+          example: Missing or malformed Authorization header.
+
+    Location:
+      type: object
+      required:
+        - lat
+        - lng
+      properties:
+        lat:
+          type: number
+          format: float
+          minimum: -90.0
+          maximum: 90.0
+          example: 26.8467
+        lng:
+          type: number
+          format: float
+          minimum: -180.0
+          maximum: 180.0
+          example: 80.9462
+
+    Component:
+      type: object
+      required:
+        - type
+        - model
+        - serial
+      properties:
+        type:
+          type: string
+          example: solar_panel
+        model:
+          type: string
+          example: Mono-PERC-550W
+        serial:
+          type: string
+          example: SN-550-001
+        warranty_until:
+          type: string
+          format: date-time
+          example: "2036-08-01T00:00:00Z"
+
+    UserProfile:
+      type: object
+      properties:
+        uid:
+          type: string
+          example: uid_owner
+        email:
+          type: string
+          format: email
+          example: owner@solar.com
+        name:
+          type: string
+          example: Solar Owner
+        role:
+          type: string
+          enum: [owner, technician, admin]
+          example: owner
+        created_at:
+          type: string
+          format: date-time
+
+    TelemetryReading:
+      type: object
+      properties:
+        id:
+          type: string
+          example: read_1787335200
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-08-21T10:00:00+00:00"
+        unix_timestamp:
+          type: integer
+          example: 1787335200
+        voltage:
+          type: number
+          example: 48.2
+        current:
+          type: number
+          example: 10.5
+        power:
+          type: number
+          example: 506.1
+        expected_power:
+          type: number
+          example: 550.0
+        performance_ratio:
+          type: number
+          example: 0.9202
+        irradiance:
+          type: number
+          example: 850.0
+        temperature_ambient:
+          type: number
+          example: 28.5
+        temperature_panel:
+          type: number
+          example: 42.0
+        humidity:
+          type: number
+          example: 45.0
+        system_id:
+          type: string
+          example: SYS-OWNER001
+        site_id:
+          type: string
+          example: SITE-OWNER001
+
+    IngestPayload:
+      type: object
+      required:
+        - voltage
+        - current
+        - power
+        - expected_power
+      properties:
+        voltage:
+          type: number
+          example: 48.2
+        current:
+          type: number
+          example: 10.5
+        power:
+          type: number
+          example: 506.1
+        expected_power:
+          type: number
+          example: 550.0
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-08-21T10:00:00Z"
+        irradiance:
+          type: number
+          example: 850.0
+        lux:
+          type: number
+          example: 102000.0
+        temperature_ambient:
+          type: number
+          example: 28.5
+        temperature_panel:
+          type: number
+          example: 42.0
+        humidity:
+          type: number
+          example: 45.0
+        system_id:
+          type: string
+          example: SYS-OWNER001
+        site_id:
+          type: string
+          example: SITE-OWNER001
+
+    Alert:
+      type: object
+      properties:
+        id:
+          type: string
+          example: alert_123
+        timestamp:
+          type: string
+          format: date-time
+        type:
+          type: string
+          example: performance_drop
+        severity:
+          type: string
+          enum: [warning, critical]
+          example: warning
+        performance_ratio:
+          type: number
+          example: 0.58
+        threshold:
+          type: number
+          example: 0.70
+        active:
+          type: boolean
+          example: true
+        status:
+          type: string
+          example: active
+        message:
+          type: string
+          example: "Performance Degradation Detected! Average PR dropped to 0.58"
+        lost_energy_kwh:
+          type: number
+          example: 0.45
+
+    Site:
+      type: object
+      properties:
+        site_id:
+          type: string
+          example: SITE-AB12CD34
+        owner_uid:
+          type: string
+          example: uid_owner
+        site_name:
+          type: string
+          example: Headquarters Solar Array
+        address:
+          type: string
+          example: 123 Solar Way, Lucknow, UP
+        location:
+          $ref: '#/components/schemas/Location'
+        created_at:
+          type: string
+          format: date-time
+
+    SiteCreatePayload:
+      type: object
+      required:
+        - site_name
+        - location
+      properties:
+        site_name:
+          type: string
+          example: Headquarters Solar Array
+        address:
+          type: string
+          example: 123 Solar Way, Lucknow, UP
+        location:
+          $ref: '#/components/schemas/Location'
+
+    System:
+      type: object
+      properties:
+        system_id:
+          type: string
+          example: SYS-12345678
+        owner_uid:
+          type: string
+          example: uid_owner
+        site_id:
+          type: string
+          example: SITE-AB12CD34
+        name:
+          type: string
+          example: Main Rooftop Solar Array
+        location:
+          $ref: '#/components/schemas/Location'
+        installation_date:
+          type: string
+          format: date-time
+        panel_capacity_watts:
+          type: number
+          example: 5000
+        inverter_type:
+          type: string
+          example: String Inverter
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/Component'
+        created_at:
+          type: string
+          format: date-time
+
+    SystemCreatePayload:
+      type: object
+      required:
+        - name
+        - location
+        - installation_date
+        - panel_capacity_watts
+        - inverter_type
+      properties:
+        name:
+          type: string
+          example: Main Rooftop Solar Array
+        location:
+          $ref: '#/components/schemas/Location'
+        installation_date:
+          type: string
+          format: date-time
+          example: "2026-08-01T00:00:00Z"
+        panel_capacity_watts:
+          type: number
+          example: 5000
+        inverter_type:
+          type: string
+          example: String Inverter
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/Component'
+        qr_code_data:
+          type: string
+        site_id:
+          type: string
+          example: SITE-AB12CD34
+
+    Assignment:
+      type: object
+      properties:
+        assignment_id:
+          type: string
+          example: ASG-12345678
+        technician_uid:
+          type: string
+          example: uid_tech
+        system_id:
+          type: string
+          example: SYS-12345678
+        site_id:
+          type: string
+          example: SITE-AB12CD34
+        assigned_by:
+          type: string
+          example: uid_admin
+        status:
+          type: string
+          example: active
+        assigned_at:
+          type: string
+          format: date-time
+
+    ReportResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        report_type:
+          type: string
+          enum: [daily, weekly, monthly]
+        system_id:
+          type: string
+          example: SYS-OWNER001
+        data_available:
+          type: boolean
+          example: true
+        generation:
+          type: object
+          properties:
+            actual_kwh:
+              type: number
+              example: 24.5
+            expected_kwh:
+              type: number
+              example: 28.0
+            lost_kwh:
+              type: number
+              example: 3.5
+            loss_percent:
+              type: number
+              example: 12.5
+            expected_generation_available:
+              type: boolean
+              example: true
+        performance:
+          type: object
+          properties:
+            performance_ratio:
+              type: number
+              example: 0.875
+            performance_ratio_percent:
+              type: number
+              example: 87.5
+            peak_power_w:
+              type: number
+              example: 4800.0
+        environment:
+          type: object
+          properties:
+            average_temperature_c:
+              type: number
+              example: 31.5
+            rain_events:
+              type: integer
+              example: 0
+        data_quality:
+          type: object
+          properties:
+            reading_count:
+              type: integer
+            expected_readings:
+              type: integer
+            data_completeness_percent:
+              type: number
+            valid_reading_count:
+              type: integer
+            invalid_reading_count:
+              type: integer
+            data_gap_count:
+              type: integer
+            total_gap_minutes:
+              type: number
+            max_integration_gap_minutes:
+              type: number
+
+    PredictionResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        predicted_power:
+          type: number
+          example: 4250.75
+        predicted_normalized_power:
+          type: number
+          example: 850.15
+        system_capacity_kw:
+          type: number
+          example: 5.0
+        model_type:
+          type: string
+          example: LinearRegression
+        model_version:
+          type: integer
+          example: 3
+        r2:
+          type: number
+          example: 0.985
+        mae:
+          type: number
+          example: 12.4
+
+    HealthScoreResponse:
+      type: object
+      properties:
+        system_id:
+          type: string
+          example: SYS-OWNER001
+        health_score:
+          type: number
+          example: 92.5
+        status:
+          type: string
+          enum: [Excellent, Good, Warning, Critical, N/A]
+          example: Excellent
+        average_pr:
+          type: number
+          example: 0.915
+        pr_variance:
+          type: number
+          example: 0.0012
+        anomaly_count:
+          type: integer
+          example: 1
+        anomaly_ratio:
+          type: number
+          example: 0.01
+        avg_loss_percent:
+          type: number
+          example: 6.2
+        readings_analyzed:
+          type: integer
+          example: 100
+        daytime_readings_analyzed:
+          type: integer
+          example: 95
+
+    Document:
+      type: object
+      properties:
+        doc_id:
+          type: string
+          example: DOC-12345678
+        system_id:
+          type: string
+          example: SYS-12345678
+        site_id:
+          type: string
+          example: SITE-AB12CD34
+        type:
+          type: string
+          example: manual
+        filename:
+          type: string
+          example: Inverter_Manual_v1.pdf
+        format:
+          type: string
+          example: PDF
+        file_size:
+          type: integer
+          example: 1048576
+        file_url:
+          type: string
+        storage_path:
+          type: string
+        version:
+          type: integer
+          example: 1
+        status:
+          type: string
+          enum: [Active, Expiring Soon, Expired]
+          example: Active
+        issue_date:
+          type: string
+          format: date
+        expiry_date:
+          type: string
+          format: date
+        uploaded_by:
+          type: string
+        uploaded_at:
+          type: string
+          format: date-time
+
+    AnalysisSummary:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        latest_pr:
+          type: number
+          example: 0.92
+        average_window_pr:
+          type: number
+          example: 0.91
+        is_anomaly:
+          type: boolean
+          example: false
+        lost_energy_kwh:
+          type: number
+          example: 0.0
+        alert_active:
+          type: boolean
+          example: false
+
+    AdminStats:
+      type: object
+      properties:
+        total_users:
+          type: integer
+          example: 8
+        users_by_role:
+          type: object
+          properties:
+            owner:
+              type: integer
+            technician:
+              type: integer
+            admin:
+              type: integer
+        total_sites:
+          type: integer
+        total_systems:
+          type: integer
+        total_active_assignments:
+          type: integer
+        total_active_alerts:
+          type: integer
+        total_documents:
+          type: integer
+        generated_at:
+          type: string
+          format: date-time
+
+    AdminReportsSummary:
+      type: object
+      properties:
+        total_users:
+          type: integer
+        total_sites:
+          type: integer
+        total_systems:
+          type: integer
+        total_readings:
+          type: integer
+        active_alerts:
+          type: integer
+        average_health_score:
+          type: number
+        overall_generation:
+          type: number
+        overall_expected_generation:
+          type: number
+        total_lost_generation:
+          type: number
+        average_performance_ratio:
+          type: number
+        generated_at:
+          type: string
+          format: date-time
+
+    PaginatedEnvelope:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+        total:
+          type: integer
+          example: 50
+        page:
+          type: integer
+          example: 1
+        per_page:
+          type: integer
+          example: 50
+        total_pages:
+          type: integer
+          example: 1

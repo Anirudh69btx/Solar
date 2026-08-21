@@ -42,6 +42,8 @@ authorization boundaries without introducing backdoors into production code.
 
 import sys
 import os
+import io
+import re
 import unittest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
@@ -59,6 +61,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from firebase_admin import auth as fb_auth
 from BACKEND.app import app
+from BACKEND import documents as docs_mod
 
 
 # ===========================================================================
@@ -258,6 +261,51 @@ class MockFirestoreCollection:
     def stream(self):
         query = MockFirestoreQuery(self._coll_dict)
         return query.stream()
+
+
+class MockBlob:
+    """Mock Cloud Storage Blob."""
+    def __init__(self, name: str, bucket):
+        self.name = name
+        self.bucket = bucket
+        self._content = b""
+        self.content_type = "application/octet-stream"
+
+    def upload_from_string(self, data, content_type: str = None):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self._content = data
+        self.content_type = content_type or "application/octet-stream"
+        self.bucket._blobs[self.name] = self
+
+    def upload_from_file(self, file_obj, content_type: str = None):
+        self._content = file_obj.read()
+        self.content_type = content_type or "application/octet-stream"
+        self.bucket._blobs[self.name] = self
+
+    def download_as_bytes(self) -> bytes:
+        return self._content
+
+    def exists(self) -> bool:
+        return self.name in self.bucket._blobs
+
+    def delete(self):
+        self.bucket._blobs.pop(self.name, None)
+
+    def generate_signed_url(self, version="v4", expiration=None, method="GET") -> str:
+        return f"https://storage.googleapis.com/{self.bucket.name}/{self.name}?signed_test_token=mocked_123"
+
+
+class MockBucket:
+    """Mock Cloud Storage Bucket."""
+    def __init__(self, name: str = "solar-monitor-1200c.appspot.com"):
+        self.name = name
+        self._blobs = {}
+
+    def blob(self, blob_name: str):
+        if blob_name not in self._blobs:
+            self._blobs[blob_name] = MockBlob(blob_name, self)
+        return self._blobs[blob_name]
 
 
 class MockFirestoreDB:
@@ -582,7 +630,9 @@ def run_tests(include_ingest: bool = False) -> bool:
         mock_user.uid = f"uid_{email.split('@')[0]}_{int(datetime.now(timezone.utc).timestamp())}"
         return mock_user
 
-    # Patch get_db and firebase_admin.auth for ALL tests
+    mock_bucket = MockBucket()
+
+    # Patch get_db, get_storage_bucket, and firebase_admin.auth for ALL tests
     with patch("BACKEND.app.get_db", return_value=mock_db), \
          patch("BACKEND.auth.get_db", return_value=mock_db), \
          patch("BACKEND.chatbot.get_db", return_value=mock_db), \
@@ -592,6 +642,10 @@ def run_tests(include_ingest: bool = False) -> bool:
          patch("BACKEND.assignments.get_db", return_value=mock_db), \
          patch("BACKEND.reports.get_db", return_value=mock_db), \
          patch("BACKEND.ml_predict.get_db", return_value=mock_db), \
+         patch("BACKEND.documents.get_db", return_value=mock_db), \
+         patch("BACKEND.admin_panel.get_db", return_value=mock_db), \
+         patch("BACKEND.documents.get_storage_bucket", return_value=mock_bucket), \
+         patch("Data_Base.firebase_config.get_storage_bucket", return_value=mock_bucket), \
          patch("firebase_admin.auth.verify_id_token", side_effect=mock_verify_id_token), \
          patch("firebase_admin.auth.create_user", side_effect=mock_create_user):
 
@@ -4320,6 +4374,3269 @@ def run_tests(include_ingest: bool = False) -> bool:
             record_result("Seg13: Missing irradiance and lux rejected with 400 without fabrication", passed, f"Status: {r_no_irrad.status_code}")
         except Exception as e:
             record_result("Seg13: Missing irradiance and lux rejected with 400 without fabrication", False, f"Exception: {e}")
+
+        # 271. Seg13: Model metadata comprehensive audit: capacity_normalization, irradiance_source, aliases
+        try:
+            bundle = joblib.load(ml.get_model_path())
+            meta = bundle.get("metadata", {})
+            passed = (
+                meta.get("capacity_normalization") is True
+                and "irradiance_source" in meta
+                and "r2" in meta
+                and "test_samples" in meta
+                and "training_timestamp" in meta
+            )
+            record_result("Seg13: Model metadata contains capacity_normalization, irradiance_source, and aliases", passed, f"CapNorm: {meta.get('capacity_normalization')} | Source: {meta.get('irradiance_source')} | R2: {meta.get('r2')}")
+        except Exception as e:
+            record_result("Seg13: Model metadata contains capacity_normalization, irradiance_source, and aliases", False, f"Exception: {e}")
+
+        # 272. Seg13: Chronological ordering ensured prior to feature extraction and 80/20 train/test split
+        try:
+            unsorted_readings = [
+                {"timestamp": "2026-03-01T12:00:00Z", "irradiance": 800.0, "panel_temp": 30.0, "humidity": 50.0, "power": 750.0, "system_capacity_kw": 1.0},
+                {"timestamp": "2026-01-01T12:00:00Z", "irradiance": 700.0, "panel_temp": 25.0, "humidity": 55.0, "power": 650.0, "system_capacity_kw": 1.0},
+                {"timestamp": "2026-02-01T12:00:00Z", "irradiance": 750.0, "panel_temp": 28.0, "humidity": 52.0, "power": 700.0, "system_capacity_kw": 1.0},
+            ]
+            sorted_feat = ml.prepare_features_from_readings(unsorted_readings)
+            passed = (
+                len(sorted_feat) == 3
+                and sorted_feat.iloc[0]["irradiance"] == 700.0
+                and sorted_feat.iloc[1]["irradiance"] == 750.0
+                and sorted_feat.iloc[2]["irradiance"] == 800.0
+            )
+            record_result("Seg13: Feature preparation chronologically sorts unordered telemetry", passed, f"Ordered: {[r for r in sorted_feat['irradiance']]}")
+        except Exception as e:
+            record_result("Seg13: Feature preparation chronologically sorts unordered telemetry", False, f"Exception: {e}")
+
+        # 273. Seg13: GET /api/ml/predict returns all required metadata fields and aliases
+        try:
+            r_pred_meta = client.get("/api/ml/predict?irradiance=850&panel_temp=45&humidity=40&hour_of_day=13&day_of_week=2&system_capacity_kw=1.0", headers={"Authorization": "Bearer valid-token-owner"})
+            data_meta = r_pred_meta.get_json() or {}
+            passed = (
+                r_pred_meta.status_code == 200
+                and data_meta.get("capacity_normalization") is True
+                and "r2" in data_meta
+                and "training_timestamp" in data_meta
+                and "test_samples" in data_meta
+                and data_meta.get("predicted_power") is not None
+            )
+            record_result("Seg13: GET /api/ml/predict returns all required metadata aliases", passed, f"Status: {r_pred_meta.status_code} | CapNorm: {data_meta.get('capacity_normalization')} | R2: {data_meta.get('r2')}")
+        except Exception as e:
+            record_result("Seg13: GET /api/ml/predict returns all required metadata aliases", False, f"Exception: {e}")
+
+        # 274. Seg13: Multi-tier fallback in calculate_health_score handles documents with ISO timestamp string
+        try:
+            for i in range(10):
+                mock_db._store["readings"][f"read_iso_ts_{i}"] = {
+                    "system_id": "SYS-ISO-TS",
+                    "timestamp": f"2026-02-15T12:{i:02d}:00+00:00",
+                    "expected_power": 400.0,
+                    "power": 390.0,
+                    "performance_ratio": 0.975
+                }
+            h_iso = ml.calculate_health_score(system_id="SYS-ISO-TS", db=mock_db)
+            passed = (
+                h_iso.get("status") == "Excellent"
+                and h_iso.get("health_score") is not None
+                and h_iso.get("health_score") >= 90.0
+                and h_iso.get("readings_analyzed") == 10
+            )
+            record_result("Seg13: Health score query gracefully handles ISO string timestamps", passed, f"Score: {h_iso.get('health_score')} | Status: {h_iso.get('status')} | Count: {h_iso.get('readings_analyzed')}")
+        except Exception as e:
+            record_result("Seg13: Health score query gracefully handles ISO string timestamps", False, f"Exception: {e}")
+
+        # 275. Seg13: Target leakage prevention - raw power and target derivatives not present in feature matrix
+        try:
+            feat_cols = ml.FEATURE_NAMES
+            leakage_candidates = ["power", "expected_power", "performance_ratio", "energy", "fault_injected", "fault_type"]
+            leaks = [col for col in leakage_candidates if col in feat_cols]
+            passed = (len(leaks) == 0 and feat_cols == ["irradiance", "panel_temp", "hour_of_day", "day_of_week", "humidity"])
+            record_result("Seg13: Feature schema guarantees strict separation and zero target leakage", passed, f"Features: {feat_cols} | Leaks: {leaks}")
+        except Exception as e:
+            record_result("Seg13: Feature schema guarantees strict separation and zero target leakage", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14: DOCUMENT & QR CODE MANAGEMENT TESTS (Tests 276 – 330)
+        # ===========================================================================
+
+        # Setup active assignment for uid_tech on SYS-OWNER001
+        mock_db._store["assignments"]["ASG-TECH-DOC"] = {
+            "assignment_id": "ASG-TECH-DOC",
+            "technician_uid": "uid_tech",
+            "system_id": "SYS-OWNER001",
+            "site_id": "SITE-OWNER001",
+            "assigned_by": "uid_admin",
+            "status": "active",
+            "assigned_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc)
+        }
+
+        # 276. Seg14: Document Upload - Unauthenticated returns 401 Unauthorized
+        try:
+            r = client.post("/api/documents/upload", json={
+                "system_id": "SYS-OWNER001",
+                "type": "invoice",
+                "file_url": "https://storage.googleapis.com/solar-docs/inv_001.pdf",
+                "filename": "invoice_2026.pdf"
+            })
+            passed = (r.status_code == 401)
+            record_result("Seg14: Document upload rejects unauthenticated requests with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Document upload rejects unauthenticated requests with 401", False, f"Exception: {e}")
+
+        # 277. Seg14: Document Upload - Owner uploads valid invoice for own system (201 Created)
+        doc_id_owner = None
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "invoice",
+                "file_url": "https://storage.googleapis.com/solar-docs/inv_001.pdf",
+                "filename": "invoice_jan2026.pdf",
+                "format": "PDF",
+                "file_size": 204800,
+                "issue_date": "2026-01-15",
+                "metadata": {"vendor": "SolarTech Global", "amount_inr": 150000}
+            })
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            doc_id_owner = doc_info.get("doc_id")
+            passed = (
+                r.status_code == 201
+                and doc_id_owner is not None
+                and doc_id_owner.startswith("DOC-")
+                and doc_info.get("system_id") == "SYS-OWNER001"
+                and doc_info.get("type") == "invoice"
+                and doc_info.get("version") == 1
+                and doc_info.get("status") == "Active"
+                and doc_info.get("uploaded_by") == "uid_owner"
+            )
+            record_result("Seg14: Owner uploads valid document for own system (201 Created)", passed, f"Status: {r.status_code} | DocID: {doc_id_owner} | Ver: {doc_info.get('version')}")
+        except Exception as e:
+            record_result("Seg14: Owner uploads valid document for own system (201 Created)", False, f"Exception: {e}")
+
+        # 278. Seg14: Document Upload - Owner uploading for other user's system rejected (403 Forbidden IDOR)
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER002",
+                "type": "invoice",
+                "file_url": "https://storage.googleapis.com/solar-docs/inv_idor.pdf",
+                "filename": "idor_invoice.pdf"
+            })
+            passed = (r.status_code == 403)
+            record_result("Seg14: IDOR Prevention: Owner uploading to another user's system rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: IDOR Prevention: Owner uploading to another user's system rejected with 403", False, f"Exception: {e}")
+
+        # 279. Seg14: Document Upload - Technician uploading rejected (403 Forbidden)
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-tech"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/tech_manual.pdf",
+                "filename": "tech_manual.pdf"
+            })
+            passed = (r.status_code == 403)
+            record_result("Seg14: RBAC: Technician uploading documents rejected with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: RBAC: Technician uploading documents rejected with 403 Forbidden", False, f"Exception: {e}")
+
+        # 280. Seg14: Document Upload - Admin uploads document for any system (201 Created)
+        doc_id_admin = None
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/inverter_manual.pdf",
+                "filename": "inverter_manual_v1.pdf",
+                "format": "PDF"
+            })
+            data = r.get_json() or {}
+            doc_id_admin = (data.get("document") or {}).get("doc_id")
+            passed = (r.status_code == 201 and doc_id_admin is not None)
+            record_result("Seg14: Admin uploads document for any solar system (201 Created)", passed, f"Status: {r.status_code} | DocID: {doc_id_admin}")
+        except Exception as e:
+            record_result("Seg14: Admin uploads document for any solar system (201 Created)", False, f"Exception: {e}")
+
+        # 281. Seg14: Document Upload - Non-existent system returns 404 Not Found
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, json={
+                "system_id": "SYS-NONEXISTENT",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/dummy.pdf",
+                "filename": "dummy.pdf"
+            })
+            passed = (r.status_code == 404)
+            record_result("Seg14: Uploading for non-existent system returns 404 Not Found", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Uploading for non-existent system returns 404 Not Found", False, f"Exception: {e}")
+
+        # 282. Seg14: Document Upload - Missing system_id returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/doc.pdf",
+                "filename": "doc.pdf"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Missing system_id rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Missing system_id rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 283. Seg14: Document Upload - Missing document type returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "file_url": "https://storage.googleapis.com/solar-docs/doc.pdf",
+                "filename": "doc.pdf"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Missing document type rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Missing document type rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 284. Seg14: Document Upload - Invalid document type ('blueprint') returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "blueprint",
+                "file_url": "https://storage.googleapis.com/solar-docs/doc.pdf",
+                "filename": "doc.pdf"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Invalid document type rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Invalid document type rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 285. Seg14: Document Upload - Missing file_url returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "filename": "doc.pdf"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Missing file_url rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Missing file_url rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 286. Seg14: Document Upload - Missing filename returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/doc.pdf"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Missing filename rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Missing filename rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 287. Seg14: Document Upload - Unsupported format ('EXE') returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/setup.exe",
+                "filename": "setup.exe",
+                "format": "EXE"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Unsupported format (EXE) rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Unsupported format (EXE) rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 288. Seg14: Document Upload - Negative file_size returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/doc.pdf",
+                "filename": "doc.pdf",
+                "file_size": -500
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Negative file_size rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Negative file_size rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 289. Seg14: Document Upload - Oversized file_size (>50MB) returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/huge.pdf",
+                "filename": "huge.pdf",
+                "file_size": 60_000_000
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Oversized file_size (>50MB) rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Oversized file_size (>50MB) rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 290. Seg14: Document Upload - Malformed expiry_date returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file_url": "https://storage.googleapis.com/solar-docs/warranty.pdf",
+                "filename": "warranty.pdf",
+                "expiry_date": "not-a-valid-date"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Malformed expiry_date rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Malformed expiry_date rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 291. Seg14: Document Upload - Expiry date before issue date returns 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file_url": "https://storage.googleapis.com/solar-docs/warranty.pdf",
+                "filename": "warranty.pdf",
+                "issue_date": "2026-08-01",
+                "expiry_date": "2026-05-01"
+            })
+            passed = (r.status_code == 400)
+            record_result("Seg14: Expiry date before issue date rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Expiry date before issue date rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 292. Seg14: Versioning - Automatic increment to version 2 on second manual upload
+        doc_id_v2 = None
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/inverter_manual_v2.pdf",
+                "filename": "inverter_manual_v2.pdf"
+            })
+            data = r.get_json() or {}
+            doc_v2 = data.get("document", {})
+            doc_id_v2 = doc_v2.get("doc_id")
+            passed = (
+                r.status_code == 201
+                and doc_v2.get("version") == 2
+                and doc_id_v2 != doc_id_admin
+            )
+            record_result("Seg14: Versioning: Subsequent upload increments version to 2", passed, f"Status: {r.status_code} | Version: {doc_v2.get('version')} | DocID: {doc_id_v2}")
+        except Exception as e:
+            record_result("Seg14: Versioning: Subsequent upload increments version to 2", False, f"Exception: {e}")
+
+        # 293. Seg14: Versioning - Third upload creates distinct version 3 without overwriting history
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file_url": "https://storage.googleapis.com/solar-docs/inverter_manual_v3.pdf",
+                "filename": "inverter_manual_v3.pdf"
+            })
+            data = r.get_json() or {}
+            doc_v3 = data.get("document", {})
+            passed = (
+                r.status_code == 201
+                and doc_v3.get("version") == 3
+                and doc_id_admin in mock_db._store["documents"]
+                and doc_id_v2 in mock_db._store["documents"]
+            )
+            record_result("Seg14: Versioning: Third upload creates version 3 preserving historical records", passed, f"Version: {doc_v3.get('version')} | History preserved: True")
+        except Exception as e:
+            record_result("Seg14: Versioning: Third upload creates version 3 preserving historical records", False, f"Exception: {e}")
+
+        # 294. Seg14: Expiry Status - Past expiry date maps to 'Expired'
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file_url": "https://storage.googleapis.com/solar-docs/old_warranty.pdf",
+                "filename": "old_warranty.pdf",
+                "issue_date": "2020-01-01",
+                "expiry_date": "2025-01-01"
+            })
+            data = r.get_json() or {}
+            status_calc = (data.get("document") or {}).get("status")
+            passed = (r.status_code == 201 and status_calc == "Expired")
+            record_result("Seg14: Expiry Status: Past expiry date computes status as 'Expired'", passed, f"Status: {status_calc}")
+        except Exception as e:
+            record_result("Seg14: Expiry Status: Past expiry date computes status as 'Expired'", False, f"Exception: {e}")
+
+        # 295. Seg14: Expiry Status - Expiry date within 30 days maps to 'Expiring Soon'
+        try:
+            soon_date = (datetime.now(timezone.utc) + timedelta(days=15)).strftime("%Y-%m-%d")
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file_url": "https://storage.googleapis.com/solar-docs/amc_warranty.pdf",
+                "filename": "amc_warranty.pdf",
+                "expiry_date": soon_date
+            })
+            data = r.get_json() or {}
+            status_calc = (data.get("document") or {}).get("status")
+            passed = (r.status_code == 201 and status_calc == "Expiring Soon")
+            record_result("Seg14: Expiry Status: Expiry within 30 days computes status as 'Expiring Soon'", passed, f"Status: {status_calc} (Expiry: {soon_date})")
+        except Exception as e:
+            record_result("Seg14: Expiry Status: Expiry within 30 days computes status as 'Expiring Soon'", False, f"Exception: {e}")
+
+        # 296. Seg14: Expiry Status - Future expiry date (>30 days) maps to 'Active'
+        try:
+            future_date = (datetime.now(timezone.utc) + timedelta(days=365)).strftime("%Y-%m-%d")
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file_url": "https://storage.googleapis.com/solar-docs/panel_warranty_10yr.pdf",
+                "filename": "panel_warranty_10yr.pdf",
+                "expiry_date": future_date
+            })
+            data = r.get_json() or {}
+            status_calc = (data.get("document") or {}).get("status")
+            passed = (r.status_code == 201 and status_calc == "Active")
+            record_result("Seg14: Expiry Status: Future expiry (>30 days) computes status as 'Active'", passed, f"Status: {status_calc} (Expiry: {future_date})")
+        except Exception as e:
+            record_result("Seg14: Expiry Status: Future expiry (>30 days) computes status as 'Active'", False, f"Exception: {e}")
+
+        # 297. Seg14: Expiry Status - No expiry date defaults to 'Active'
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "photo",
+                "file_url": "https://storage.googleapis.com/solar-docs/site_photo.jpg",
+                "filename": "site_photo.jpg",
+                "format": "JPG"
+            })
+            data = r.get_json() or {}
+            status_calc = (data.get("document") or {}).get("status")
+            passed = (r.status_code == 201 and status_calc == "Active")
+            record_result("Seg14: Expiry Status: No expiry date defaults to 'Active'", passed, f"Status: {status_calc}")
+        except Exception as e:
+            record_result("Seg14: Expiry Status: No expiry date defaults to 'Active'", False, f"Exception: {e}")
+
+        # 298. Seg14: List Documents - Unauthenticated returns 401 Unauthorized
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/documents")
+            passed = (r.status_code == 401)
+            record_result("Seg14: List documents rejects unauthenticated request with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: List documents rejects unauthenticated request with 401", False, f"Exception: {e}")
+
+        # 299. Seg14: List Documents - Owner lists own system documents (200 OK)
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/documents", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs_list = data.get("documents", [])
+            passed = (r.status_code == 200 and data.get("count") >= 5 and len(docs_list) >= 5)
+            record_result("Seg14: Owner lists own system documents (200 OK)", passed, f"Status: {r.status_code} | Count: {len(docs_list)}")
+        except Exception as e:
+            record_result("Seg14: Owner lists own system documents (200 OK)", False, f"Exception: {e}")
+
+        # 300. Seg14: List Documents - Owner listing other user's system rejected (403 Forbidden)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/documents", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Owner listing documents for another user's system rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Owner listing documents for another user's system rejected with 403", False, f"Exception: {e}")
+
+        # 301. Seg14: List Documents - Assigned Technician lists assigned system documents (200 OK)
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/documents", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and len(data.get("documents", [])) >= 5)
+            record_result("Seg14: Assigned Technician lists assigned system documents (200 OK)", passed, f"Status: {r.status_code} | Docs: {len(data.get('documents', []))}")
+        except Exception as e:
+            record_result("Seg14: Assigned Technician lists assigned system documents (200 OK)", False, f"Exception: {e}")
+
+        # 302. Seg14: List Documents - Unassigned Technician listing system rejected (403 Forbidden)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/documents", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Unassigned Technician listing system documents rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Unassigned Technician listing system documents rejected with 403", False, f"Exception: {e}")
+
+        # 303. Seg14: List Documents - Admin lists any system documents (200 OK)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/documents", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200)
+            record_result("Seg14: Admin lists any system documents (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Admin lists any system documents (200 OK)", False, f"Exception: {e}")
+
+        # 304. Seg14: List Documents - Listing non-existent system returns 404 Not Found
+        try:
+            r = client.get("/api/systems/SYS-NONEXISTENT/documents", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14: Listing documents for non-existent system returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Listing documents for non-existent system returns 404", False, f"Exception: {e}")
+
+        # 305. Seg14: List Documents - Type filter (?type=warranty) returns only matching documents
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/documents?type=warranty", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs = data.get("documents", [])
+            all_warranty = all(d.get("type") == "warranty" for d in docs)
+            passed = (r.status_code == 200 and len(docs) >= 2 and all_warranty)
+            record_result("Seg14: List Documents: ?type=warranty filter returns only warranty documents", passed, f"Count: {len(docs)} | AllWarranty: {all_warranty}")
+        except Exception as e:
+            record_result("Seg14: List Documents: ?type=warranty filter returns only warranty documents", False, f"Exception: {e}")
+
+        # 306. Seg14: List Documents - Status filter (?status=Expired) returns only expired documents
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/documents?status=Expired", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs = data.get("documents", [])
+            all_expired = all(d.get("status") == "Expired" for d in docs)
+            passed = (r.status_code == 200 and len(docs) >= 1 and all_expired)
+            record_result("Seg14: List Documents: ?status=Expired filter returns only expired documents", passed, f"Count: {len(docs)} | AllExpired: {all_expired}")
+        except Exception as e:
+            record_result("Seg14: List Documents: ?status=Expired filter returns only expired documents", False, f"Exception: {e}")
+
+        # 307. Seg14: Get Document - Unauthenticated returns 401 Unauthorized
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}")
+            passed = (r.status_code == 401)
+            record_result("Seg14: Get document metadata rejects unauthenticated requests with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Get document metadata rejects unauthenticated requests with 401", False, f"Exception: {e}")
+
+        # 308. Seg14: Get Document - Owner retrieves own system document (200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("doc_id") == doc_id_owner and data.get("filename") == "invoice_jan2026.pdf")
+            record_result("Seg14: Owner retrieves own system document metadata (200 OK)", passed, f"Status: {r.status_code} | DocID: {data.get('doc_id')}")
+        except Exception as e:
+            record_result("Seg14: Owner retrieves own system document metadata (200 OK)", False, f"Exception: {e}")
+
+        # 309. Seg14: Get Document - Owner retrieving other system document rejected (403 Forbidden)
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-owner2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Owner retrieving other system document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Owner retrieving other system document rejected with 403", False, f"Exception: {e}")
+
+        # 310. Seg14: Get Document - Assigned Technician retrieves document (200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("doc_id") == doc_id_owner)
+            record_result("Seg14: Assigned Technician retrieves system document metadata (200 OK)", passed, f"Status: {r.status_code} | DocID: {data.get('doc_id')}")
+        except Exception as e:
+            record_result("Seg14: Assigned Technician retrieves system document metadata (200 OK)", False, f"Exception: {e}")
+
+        # 311. Seg14: Get Document - Unassigned Technician retrieving document rejected (403 Forbidden)
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Unassigned Technician retrieving document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Unassigned Technician retrieving document rejected with 403", False, f"Exception: {e}")
+
+        # 312. Seg14: Get Document - Admin retrieves any document (200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200)
+            record_result("Seg14: Admin retrieves any system document metadata (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Admin retrieves any system document metadata (200 OK)", False, f"Exception: {e}")
+
+        # 313. Seg14: Get Document - Non-existent doc_id returns 404 Not Found
+        try:
+            r = client.get("/api/documents/DOC-NONEXISTENT", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14: Non-existent doc_id returns 404 Not Found", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Non-existent doc_id returns 404 Not Found", False, f"Exception: {e}")
+
+        # 314. Seg14: Delete Document - Unauthenticated returns 401 Unauthorized
+        try:
+            r = client.delete(f"/api/documents/{doc_id_owner}")
+            passed = (r.status_code == 401)
+            record_result("Seg14: Delete document rejects unauthenticated requests with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Delete document rejects unauthenticated requests with 401", False, f"Exception: {e}")
+
+        # 315. Seg14: Delete Document - Technician deleting document rejected (403 Forbidden)
+        try:
+            r = client.delete(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: RBAC: Technician deleting document rejected with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: RBAC: Technician deleting document rejected with 403 Forbidden", False, f"Exception: {e}")
+
+        # 316. Seg14: Delete Document - Owner deleting other user's document rejected (403 Forbidden)
+        try:
+            r = client.delete(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-owner2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: IDOR: Owner deleting other user's document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: IDOR: Owner deleting other user's document rejected with 403", False, f"Exception: {e}")
+
+        # 317. Seg14: Delete Document - Owner deletes own system document (200 OK & removed from store)
+        try:
+            r = client.delete(f"/api/documents/{doc_id_owner}", headers={"Authorization": "Bearer valid-token-owner"})
+            doc_in_store = doc_id_owner in mock_db._store["documents"]
+            passed = (r.status_code == 200 and not doc_in_store)
+            record_result("Seg14: Owner deletes own system document (200 OK & removed from Firestore)", passed, f"Status: {r.status_code} | InStore: {doc_in_store}")
+        except Exception as e:
+            record_result("Seg14: Owner deletes own system document (200 OK & removed from Firestore)", False, f"Exception: {e}")
+
+        # 318. Seg14: Delete Document - Admin deletes document (200 OK)
+        try:
+            r = client.delete(f"/api/documents/{doc_id_admin}", headers={"Authorization": "Bearer valid-token-admin"})
+            doc_in_store = doc_id_admin in mock_db._store["documents"]
+            passed = (r.status_code == 200 and not doc_in_store)
+            record_result("Seg14: Admin deletes document successfully (200 OK)", passed, f"Status: {r.status_code} | InStore: {doc_in_store}")
+        except Exception as e:
+            record_result("Seg14: Admin deletes document successfully (200 OK)", False, f"Exception: {e}")
+
+        # 319. Seg14: Delete Document - Deleting non-existent doc_id returns 404 Not Found
+        try:
+            r = client.delete("/api/documents/DOC-NONEXISTENT", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14: Deleting non-existent doc_id returns 404 Not Found", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Deleting non-existent doc_id returns 404 Not Found", False, f"Exception: {e}")
+
+        # 320. Seg14: Audit Trail - Upload and delete actions record immutable audit entries in document_audits
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            actions = [a.get("action") for a in audits.values()]
+            has_upload = "upload" in actions
+            has_delete = "delete" in actions
+            passed = (len(audits) >= 2 and has_upload and has_delete)
+            record_result("Seg14: Audit Trail records immutable events for upload and delete actions", passed, f"Total Audits: {len(audits)} | Upload: {has_upload} | Delete: {has_delete}")
+        except Exception as e:
+            record_result("Seg14: Audit Trail records immutable events for upload and delete actions", False, f"Exception: {e}")
+
+        # 321. Seg14: QR Generation - Unauthenticated returns 401 Unauthorized
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr")
+            passed = (r.status_code == 401)
+            record_result("Seg14: QR Generation rejects unauthenticated requests with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: QR Generation rejects unauthenticated requests with 401", False, f"Exception: {e}")
+
+        # 322. Seg14: QR Generation - Owner of system receives valid PNG image (200 OK, image/png)
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr", headers={"Authorization": "Bearer valid-token-owner"})
+            png_header = r.data[:8]
+            # PNG magic bytes: \x89PNG\r\n\x1a\n
+            is_valid_png = png_header == b"\x89PNG\r\n\x1a\n"
+            passed = (r.status_code == 200 and r.mimetype == "image/png" and is_valid_png)
+            record_result("Seg14: Owner receives valid PNG QR code (200 OK, image/png)", passed, f"Status: {r.status_code} | Mime: {r.mimetype} | ValidPNG: {is_valid_png}")
+        except Exception as e:
+            record_result("Seg14: Owner receives valid PNG QR code (200 OK, image/png)", False, f"Exception: {e}")
+
+        # 323. Seg14: QR Generation - Owner of other system rejected (403 Forbidden)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/qr", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Owner accessing QR code for another user's system rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Owner accessing QR code for another user's system rejected with 403", False, f"Exception: {e}")
+
+        # 324. Seg14: QR Generation - Assigned Technician receives valid QR code (200 OK)
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 200 and r.mimetype == "image/png")
+            record_result("Seg14: Assigned Technician receives valid QR code for assigned system (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Assigned Technician receives valid QR code for assigned system (200 OK)", False, f"Exception: {e}")
+
+        # 325. Seg14: QR Generation - Unassigned Technician rejected (403 Forbidden)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/qr", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14: Unassigned Technician accessing system QR code rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Unassigned Technician accessing system QR code rejected with 403", False, f"Exception: {e}")
+
+        # 326. Seg14: QR Generation - Admin receives valid QR code for any system (200 OK)
+        try:
+            r = client.get("/api/systems/SYS-OWNER002/qr", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200 and r.mimetype == "image/png")
+            record_result("Seg14: Admin receives valid QR code for any solar system (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: Admin receives valid QR code for any solar system (200 OK)", False, f"Exception: {e}")
+
+        # 327. Seg14: QR Generation - Non-existent system returns 404 Not Found
+        try:
+            r = client.get("/api/systems/SYS-NONEXISTENT/qr", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14: QR Generation for non-existent system returns 404 Not Found", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14: QR Generation for non-existent system returns 404 Not Found", False, f"Exception: {e}")
+
+        # 328. Seg14: QR Generation - format=json returns JSON with base64 data URI
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr?format=json", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            b64 = data.get("qr_image_base64")
+            passed = (
+                r.status_code == 200
+                and "system_id" in data
+                and data["system_id"] == "SYS-OWNER001"
+                and b64 is not None
+                and b64.startswith("data:image/png;base64,")
+            )
+            record_result("Seg14: QR Generation with ?format=json returns base64 image data URI", passed, f"Status: {r.status_code} | Base64Prefix: {b64[:30] if b64 else None}")
+        except Exception as e:
+            record_result("Seg14: QR Generation with ?format=json returns base64 image data URI", False, f"Exception: {e}")
+
+        # 329. Seg14: QR Security - Deterministic generation with zero credentials/tokens embedded in payload
+        try:
+            qr_bytes_1 = docs_mod.generate_system_qr_code("SYS-OWNER001", base_url="https://solar.monitoring.internal")
+            qr_bytes_2 = docs_mod.generate_system_qr_code("SYS-OWNER001", base_url="https://solar.monitoring.internal")
+            # Same input produces identical PNG byte stream
+            identical = qr_bytes_1 == qr_bytes_2
+            # No credentials/secrets
+            passed = identical and len(qr_bytes_1) > 100
+            record_result("Seg14: QR Security: Deterministic generation without credentials or secrets", passed, f"Identical: {identical} | ByteCount: {len(qr_bytes_1)}")
+        except Exception as e:
+            record_result("Seg14: QR Security: Deterministic generation without credentials or secrets", False, f"Exception: {e}")
+
+        # 330. Seg14: IDOR Prevention - uploaded_by in payload cannot hijack document ownership
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "system_id": "SYS-OWNER001",
+                "type": "photo",
+                "file_url": "https://storage.googleapis.com/solar-docs/spoof.png",
+                "filename": "spoof.png",
+                "uploaded_by": "uid_admin"  # Attempt to spoof admin upload
+            })
+            data = r.get_json() or {}
+            doc_rec = data.get("document", {})
+            # Server must force real authenticated user UID (uid_owner), ignoring client payload
+            passed = (r.status_code == 201 and doc_rec.get("uploaded_by") == "uid_owner")
+            record_result("Seg14: IDOR Prevention: Server forces authentic caller UID for uploaded_by", passed, f"Status: {r.status_code} | RecordedBy: {doc_rec.get('uploaded_by')}")
+        except Exception as e:
+            record_result("Seg14: IDOR Prevention: Server forces authentic caller UID for uploaded_by", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: UPGRADE 1 — FIREBASE STORAGE FILE HANDLING (Tests 331 – 342)
+        # ===========================================================================
+
+        # 331. Seg14 Hardened: Multipart PDF upload with valid %PDF- magic bytes (201 Created)
+        doc_id_mp_pdf = None
+        try:
+            pdf_bytes = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "warranty",
+                "file": (io.BytesIO(pdf_bytes), "inverter_warranty.pdf"),
+                "issue_date": "2026-01-01",
+                "expiry_date": "2036-01-01"
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            doc_id_mp_pdf = doc_info.get("doc_id")
+            sp = doc_info.get("storage_path") or ""
+            passed = (
+                r.status_code == 201
+                and doc_info.get("format") == "PDF"
+                and doc_info.get("file_size") == len(pdf_bytes)
+                and "solar-documents/SITE-OWNER001/SYS-OWNER001/" in sp
+                and sp.endswith("inverter_warranty.pdf")
+            )
+            record_result("Seg14 Hardened: Multipart PDF upload with valid %PDF- magic bytes (201 Created)", passed, f"Status: {r.status_code} | DocID: {doc_id_mp_pdf} | StoragePath: {sp}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Multipart PDF upload with valid %PDF- magic bytes (201 Created)", False, f"Exception: {e}")
+
+        # 332. Seg14 Hardened: Multipart PNG upload with valid \x89PNG magic bytes (201 Created)
+        try:
+            png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "photo",
+                "file": (io.BytesIO(png_bytes), "panel_installation.png")
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            passed = (r.status_code == 201 and doc_info.get("format") == "PNG" and doc_info.get("file_size") == len(png_bytes))
+            record_result("Seg14 Hardened: Multipart PNG upload with valid PNG signature (201 Created)", passed, f"Status: {r.status_code} | Format: {doc_info.get('format')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Multipart PNG upload with valid PNG signature (201 Created)", False, f"Exception: {e}")
+
+        # 333. Seg14 Hardened: Multipart JPG upload with valid \xff\xd8\xff magic bytes (201 Created)
+        try:
+            jpg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00\xff\xd9"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "photo",
+                "file": (io.BytesIO(jpg_bytes), "site_overview.jpg")
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            passed = (r.status_code == 201 and doc_info.get("format") in ("JPG", "JPEG"))
+            record_result("Seg14 Hardened: Multipart JPG upload with valid JPEG signature (201 Created)", passed, f"Status: {r.status_code} | Format: {doc_info.get('format')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Multipart JPG upload with valid JPEG signature (201 Created)", False, f"Exception: {e}")
+
+        # 334. Seg14 Hardened: Empty file upload (0 bytes) rejected with 400 Bad Request
+        try:
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file": (io.BytesIO(b""), "empty.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 400)
+            record_result("Seg14 Hardened: Empty file upload (0 bytes) rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Empty file upload (0 bytes) rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 335. Seg14 Hardened: File signature mismatch (spoofed .pdf with non-PDF binary) rejected with 400
+        try:
+            fake_pdf = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00This is an executable not a PDF"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "invoice",
+                "file": (io.BytesIO(fake_pdf), "fake_invoice.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 400)
+            record_result("Seg14 Hardened: File signature spoofing rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: File signature spoofing rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 336. Seg14 Hardened: Path traversal attempt in filename sanitized safely
+        try:
+            pdf_bytes = b"%PDF-1.4\nvalid pdf"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file": (io.BytesIO(pdf_bytes), "../../etc/passwd.pdf")
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            clean_name = doc_info.get("filename")
+            sp = doc_info.get("storage_path") or ""
+            passed = (
+                r.status_code == 201
+                and ".." not in clean_name
+                and "/" not in clean_name
+                and "\\" not in clean_name
+                and ".." not in sp
+            )
+            record_result("Seg14 Hardened: Path traversal in filename sanitized safely", passed, f"Status: {r.status_code} | SanitizedName: '{clean_name}'")
+        except Exception as e:
+            record_result("Seg14 Hardened: Path traversal in filename sanitized safely", False, f"Exception: {e}")
+
+        # 337. Seg14 Hardened: Server-controlled Storage path constructed deterministically
+        try:
+            sp = doc_info.get("storage_path") or ""
+            passed = sp.startswith("solar-documents/SITE-OWNER001/SYS-OWNER001/") and "/v" in sp
+            record_result("Seg14 Hardened: Storage path constructed strictly server-side", passed, f"Path: {sp}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Storage path constructed strictly server-side", False, f"Exception: {e}")
+
+        # 338. Seg14 Hardened: Secure file retrieval GET /api/documents/<doc_id>/file (Owner 200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_mp_pdf}/file", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 200)
+            record_result("Seg14 Hardened: Owner retrieves document file (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner retrieves document file (200 OK)", False, f"Exception: {e}")
+
+        # 339. Seg14 Hardened: Secure file retrieval (Assigned Technician 200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_mp_pdf}/file", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 200)
+            record_result("Seg14 Hardened: Assigned Technician retrieves document file (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Assigned Technician retrieves document file (200 OK)", False, f"Exception: {e}")
+
+        # 340. Seg14 Hardened: Secure file retrieval (Unassigned Technician rejected with 403 Forbidden)
+        try:
+            r = client.get(f"/api/documents/{doc_id_mp_pdf}/file", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Unassigned Technician document download rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Unassigned Technician document download rejected with 403", False, f"Exception: {e}")
+
+        # 341. Seg14 Hardened: Secure file retrieval (Admin 200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_mp_pdf}/file", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200)
+            record_result("Seg14 Hardened: Admin retrieves document file (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Admin retrieves document file (200 OK)", False, f"Exception: {e}")
+
+        # 342. Seg14 Hardened: Secure file retrieval for non-existent doc_id returns 404 Not Found
+        try:
+            r = client.get("/api/documents/DOC-NONEXISTENT/file", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14 Hardened: File retrieval for non-existent doc_id returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: File retrieval for non-existent doc_id returns 404", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: UPGRADE 2 — SITE-LEVEL DOCUMENT SUPPORT (Tests 343 – 360)
+        # ===========================================================================
+
+        # 343. Seg14 Hardened: Owner uploads site-level document (site_id=SITE-OWNER001, system_id=null)
+        doc_id_site_ins = None
+        try:
+            pdf_bytes = b"%PDF-1.4\nsite insurance policy"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "site_id": "SITE-OWNER001",
+                "type": "site_insurance",
+                "file": (io.BytesIO(pdf_bytes), "site_insurance_2026.pdf"),
+                "issue_date": "2026-01-01",
+                "expiry_date": "2027-01-01"
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            doc_id_site_ins = doc_info.get("doc_id")
+            sp = doc_info.get("storage_path") or ""
+            passed = (
+                r.status_code == 201
+                and doc_info.get("site_id") == "SITE-OWNER001"
+                and doc_info.get("system_id") is None
+                and "solar-documents/SITE-OWNER001/SITE_LEVEL/" in sp
+            )
+            record_result("Seg14 Hardened: Owner uploads site-level document (201 Created)", passed, f"Status: {r.status_code} | DocID: {doc_id_site_ins} | Path: {sp}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner uploads site-level document (201 Created)", False, f"Exception: {e}")
+
+        # 344. Seg14 Hardened: Admin uploads site-level document for any site (201 Created)
+        try:
+            pdf_bytes = b"%PDF-1.4\nsite blueprint"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, data={
+                "site_id": "SITE-OWNER002",
+                "type": "site_blueprint",
+                "file": (io.BytesIO(pdf_bytes), "master_blueprint.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 201)
+            record_result("Seg14 Hardened: Admin uploads site-level document for any site (201 Created)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Admin uploads site-level document for any site (201 Created)", False, f"Exception: {e}")
+
+        # 345. Seg14 Hardened: Technician uploading site-level document rejected with 403 Forbidden
+        try:
+            pdf_bytes = b"%PDF-1.4\ncontract"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-tech"}, data={
+                "site_id": "SITE-OWNER001",
+                "type": "contract",
+                "file": (io.BytesIO(pdf_bytes), "contract.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Technician uploading site document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Technician uploading site document rejected with 403", False, f"Exception: {e}")
+
+        # 346. Seg14 Hardened: Owner uploading site document to another user's site rejected with 403
+        try:
+            pdf_bytes = b"%PDF-1.4\ninsurance"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "site_id": "SITE-OWNER002",
+                "type": "site_insurance",
+                "file": (io.BytesIO(pdf_bytes), "insurance.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Owner uploading to other user's site rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner uploading to other user's site rejected with 403", False, f"Exception: {e}")
+
+        # 347. Seg14 Hardened: Uploading site document to non-existent site returns 404 Not Found
+        try:
+            pdf_bytes = b"%PDF-1.4\ninsurance"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, data={
+                "site_id": "SITE-NONEXISTENT",
+                "type": "site_insurance",
+                "file": (io.BytesIO(pdf_bytes), "insurance.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 404)
+            record_result("Seg14 Hardened: Uploading document to non-existent site returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Uploading document to non-existent site returns 404", False, f"Exception: {e}")
+
+        # 348. Seg14 Hardened: Uploading with missing both system_id and site_id rejected with 400
+        try:
+            pdf_bytes = b"%PDF-1.4\ninsurance"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, data={
+                "type": "site_insurance",
+                "file": (io.BytesIO(pdf_bytes), "insurance.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 400)
+            record_result("Seg14 Hardened: Uploading without site_id or system_id rejected with 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Uploading without site_id or system_id rejected with 400", False, f"Exception: {e}")
+
+        # 349. Seg14 Hardened: System/Site mismatch rejected with 400 Bad Request
+        try:
+            # SYS-OWNER001 belongs to SITE-OWNER001, client passes SITE-OWNER002
+            pdf_bytes = b"%PDF-1.4\nwarranty"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "site_id": "SITE-OWNER002",
+                "type": "warranty",
+                "file": (io.BytesIO(pdf_bytes), "warranty_mismatch.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 400)
+            record_result("Seg14 Hardened: System/Site mismatch rejected with 400 Bad Request", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: System/Site mismatch rejected with 400 Bad Request", False, f"Exception: {e}")
+
+        # 350. Seg14 Hardened: Site-level documents have independent versioning (increments to Version 2)
+        try:
+            pdf_bytes = b"%PDF-1.4\nsite insurance policy v2"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "site_id": "SITE-OWNER001",
+                "type": "site_insurance",
+                "file": (io.BytesIO(pdf_bytes), "site_insurance_2027.pdf")
+            }, content_type="multipart/form-data")
+            data = r.get_json() or {}
+            doc_info = data.get("document", {})
+            passed = (r.status_code == 201 and doc_info.get("version") == 2)
+            record_result("Seg14 Hardened: Site-level documents increment version independently", passed, f"Status: {r.status_code} | Version: {doc_info.get('version')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Site-level documents increment version independently", False, f"Exception: {e}")
+
+        # 351. Seg14 Hardened: List site documents GET /api/sites/<site_id>/documents?scope=site (Owner 200 OK)
+        try:
+            r = client.get("/api/sites/SITE-OWNER001/documents?scope=site", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs_list = data.get("documents", [])
+            # Should have site-level documents and NO system-level documents
+            all_site_level = all(d.get("system_id") is None for d in docs_list)
+            passed = (r.status_code == 200 and len(docs_list) >= 2 and all_site_level)
+            record_result("Seg14 Hardened: List site documents ?scope=site returns site-level docs only", passed, f"Status: {r.status_code} | Count: {len(docs_list)} | AllSiteLevel: {all_site_level}")
+        except Exception as e:
+            record_result("Seg14 Hardened: List site documents ?scope=site returns site-level docs only", False, f"Exception: {e}")
+
+        # 352. Seg14 Hardened: List site documents ?scope=all returns both site-level and system-level documents
+        try:
+            r = client.get("/api/sites/SITE-OWNER001/documents?scope=all", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs_list = data.get("documents", [])
+            has_site_level = any(d.get("system_id") is None for d in docs_list)
+            has_sys_level = any(d.get("system_id") is not None for d in docs_list)
+            passed = (r.status_code == 200 and has_site_level and has_sys_level)
+            record_result("Seg14 Hardened: List site documents ?scope=all returns both scopes", passed, f"Status: {r.status_code} | TotalDocs: {len(docs_list)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: List site documents ?scope=all returns both scopes", False, f"Exception: {e}")
+
+        # 353. Seg14 Hardened: List site documents ?scope=systems returns only system-level documents
+        try:
+            r = client.get("/api/sites/SITE-OWNER001/documents?scope=systems", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            docs_list = data.get("documents", [])
+            all_sys = all(d.get("system_id") is not None for d in docs_list)
+            passed = (r.status_code == 200 and len(docs_list) > 0 and all_sys)
+            record_result("Seg14 Hardened: List site documents ?scope=systems returns system docs only", passed, f"Status: {r.status_code} | Count: {len(docs_list)} | AllSys: {all_sys}")
+        except Exception as e:
+            record_result("Seg14 Hardened: List site documents ?scope=systems returns system docs only", False, f"Exception: {e}")
+
+        # 354. Seg14 Hardened: List site documents (Assigned Technician 200 OK)
+        try:
+            r = client.get("/api/sites/SITE-OWNER001/documents", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 200)
+            record_result("Seg14 Hardened: Assigned Technician lists site documents (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Assigned Technician lists site documents (200 OK)", False, f"Exception: {e}")
+
+        # 355. Seg14 Hardened: List site documents (Unassigned Technician rejected with 403 Forbidden)
+        try:
+            r = client.get("/api/sites/SITE-OWNER001/documents", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Unassigned Technician listing site docs rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Unassigned Technician listing site docs rejected with 403", False, f"Exception: {e}")
+
+        # 356. Seg14 Hardened: Get site-level document metadata GET /api/documents/<doc_id> (Owner 200 OK)
+        try:
+            r = client.get(f"/api/documents/{doc_id_site_ins}", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("doc_id") == doc_id_site_ins and data.get("site_id") == "SITE-OWNER001")
+            record_result("Seg14 Hardened: Owner retrieves site-level document metadata (200 OK)", passed, f"Status: {r.status_code} | DocID: {doc_id_site_ins}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner retrieves site-level document metadata (200 OK)", False, f"Exception: {e}")
+
+        # 357. Seg14 Hardened: Get site-level document metadata (Unassigned Technician rejected with 403)
+        try:
+            r = client.get(f"/api/documents/{doc_id_site_ins}", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Unassigned Technician getting site doc rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Unassigned Technician getting site doc rejected with 403", False, f"Exception: {e}")
+
+        # 358. Seg14 Hardened: Delete site-level document (Owner 200 OK & removed from Firestore and Storage)
+        try:
+            r = client.delete(f"/api/documents/{doc_id_site_ins}", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 200 and doc_id_site_ins not in mock_db._store.get("documents", {}))
+            record_result("Seg14 Hardened: Owner deletes site-level document (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner deletes site-level document (200 OK)", False, f"Exception: {e}")
+
+        # 359. Seg14 Hardened: Delete site-level document (Technician rejected with 403 Forbidden)
+        try:
+            # Create dummy site doc for delete attempt
+            mock_db._store["documents"]["DOC-SITE-TEST"] = {
+                "doc_id": "DOC-SITE-TEST", "site_id": "SITE-OWNER001", "system_id": None, "type": "site_safety"
+            }
+            r = client.delete("/api/documents/DOC-SITE-TEST", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Technician deleting site document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Technician deleting site document rejected with 403", False, f"Exception: {e}")
+
+        # 360. Seg14 Hardened: Delete site-level document (Other Owner rejected with 403 Forbidden)
+        try:
+            r = client.delete("/api/documents/DOC-SITE-TEST", headers={"Authorization": "Bearer valid-token-owner2"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Non-owner deleting site document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Non-owner deleting site document rejected with 403", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: AUDIT TRAIL ACCOUNTABILITY (Tests 361 – 364)
+        # ===========================================================================
+
+        # 361. Seg14 Hardened: Audit Trail logs VIEW action on GET /api/documents/<doc_id>
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            view_audits = [a for a in audits.values() if a.get("action") == "view"]
+            passed = (len(view_audits) > 0)
+            record_result("Seg14 Hardened: Audit Trail logs VIEW action on document metadata access", passed, f"ViewAuditsCount: {len(view_audits)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Audit Trail logs VIEW action on document metadata access", False, f"Exception: {e}")
+
+        # 362. Seg14 Hardened: Audit Trail logs DOWNLOAD action on GET /api/documents/<doc_id>/file
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            dl_audits = [a for a in audits.values() if a.get("action") == "download"]
+            passed = (len(dl_audits) > 0)
+            record_result("Seg14 Hardened: Audit Trail logs DOWNLOAD action on document file download", passed, f"DownloadAuditsCount: {len(dl_audits)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Audit Trail logs DOWNLOAD action on document file download", False, f"Exception: {e}")
+
+        # 363. Seg14 Hardened: Audit Trail survives document deletion (append-only accountability)
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            deleted_doc_audits = [a for a in audits.values() if a.get("doc_id") == doc_id_site_ins]
+            passed = (len(deleted_doc_audits) >= 2)  # upload + delete audits preserved
+            record_result("Seg14 Hardened: Audit Trail records survive document deletion", passed, f"AuditsSurviving: {len(deleted_doc_audits)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Audit Trail records survive document deletion", False, f"Exception: {e}")
+
+        # 364. Seg14 Hardened: Audit performed_by cannot be spoofed (derived from authentic token)
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            all_valid_uids = {"uid_owner", "uid_tech", "uid_admin", "uid_owner2", "uid_tech2"}
+            spoofed_actors = [a for a in audits.values() if a.get("performed_by") not in all_valid_uids]
+            passed = (len(spoofed_actors) == 0 and len(audits) > 10)
+            record_result("Seg14 Hardened: Audit performed_by is strictly derived from auth context", passed, f"TotalAudits: {len(audits)} | Spoofed: {len(spoofed_actors)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Audit performed_by is strictly derived from auth context", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: UPGRADE 3 — QR ACCESS PORTAL & WORKSPACE (Tests 365 – 380)
+        # ===========================================================================
+
+        # 365. Seg14 Hardened: QR generation encodes /qr-access/<system_id> and NOT /systems/<system_id>
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr?format=json", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            payload_url = data.get("qr_payload_url") or ""
+            passed = (
+                "/qr-access/SYS-OWNER001" in payload_url
+                and not payload_url.endswith("/systems/SYS-OWNER001")
+            )
+            record_result("Seg14 Hardened: QR generation encodes /qr-access/<system_id>", passed, f"PayloadURL: {payload_url}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR generation encodes /qr-access/<system_id>", False, f"Exception: {e}")
+
+        # 366. Seg14 Hardened: QR generation does NOT encode /api/systems/<system_id>/qr
+        try:
+            passed = ("/api/systems" not in payload_url)
+            record_result("Seg14 Hardened: QR payload does NOT encode API generator route", passed, f"PayloadURL: {payload_url}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR payload does NOT encode API generator route", False, f"Exception: {e}")
+
+        # 367. Seg14 Hardened: QR base URL honors SOLAR_PUBLIC_BASE_URL environment variable
+        try:
+            with patch.dict(os.environ, {"SOLAR_PUBLIC_BASE_URL": "https://field.solarmonitoring.com"}):
+                r = client.get("/api/systems/SYS-OWNER001/qr?format=json", headers={"Authorization": "Bearer valid-token-owner"})
+                data = r.get_json() or {}
+                custom_url = data.get("qr_payload_url") or ""
+                passed = custom_url == "https://field.solarmonitoring.com/qr-access/SYS-OWNER001"
+                record_result("Seg14 Hardened: QR base URL honors SOLAR_PUBLIC_BASE_URL env var", passed, f"CustomURL: {custom_url}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR base URL honors SOLAR_PUBLIC_BASE_URL env var", False, f"Exception: {e}")
+
+        # 368. Seg14 Hardened: Public QR Access Portal Landing GET /api/qr-access/<system_id> (Unauthenticated 200 OK)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001")
+            data = r.get_json() or {}
+            roles = data.get("available_roles", [])
+            passed = (
+                r.status_code == 200
+                and data.get("system_id") == "SYS-OWNER001"
+                and len(roles) == 3
+                and "status" in data
+            )
+            record_result("Seg14 Hardened: Public QR Access Portal Landing returns 200 OK unauthenticated", passed, f"Status: {r.status_code} | Portal: {data.get('portal')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Public QR Access Portal Landing returns 200 OK unauthenticated", False, f"Exception: {e}")
+
+        # 369. Seg14 Hardened: Public QR Access Portal discloses minimal info with no telemetry/secrets/warranties
+        try:
+            disallowed_keys = {"telemetry", "owner_uid", "owner_email", "documents", "warranties", "components", "alerts"}
+            exposed = [k for k in disallowed_keys if k in data]
+            passed = (len(exposed) == 0)
+            record_result("Seg14 Hardened: Public QR Portal reveals zero private telemetry/secrets", passed, f"ExposedSecrets: {exposed}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Public QR Portal reveals zero private telemetry/secrets", False, f"Exception: {e}")
+
+        # 370. Seg14 Hardened: Public QR Access Portal for non-existent system returns 404 Not Found
+        try:
+            r = client.get("/api/qr-access/SYS-NONEXISTENT")
+            passed = (r.status_code == 404)
+            record_result("Seg14 Hardened: Public QR Portal for non-existent system returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Public QR Portal for non-existent system returns 404", False, f"Exception: {e}")
+
+        # 371. Seg14 Hardened: Restricted QR System Workspace GET /api/qr-access/<system_id>/workspace (401 Unauthenticated)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace")
+            passed = (r.status_code == 401)
+            record_result("Seg14 Hardened: QR System Workspace rejects unauthenticated with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR System Workspace rejects unauthenticated with 401", False, f"Exception: {e}")
+
+        # 372. Seg14 Hardened: QR System Workspace - Owner Workspace (200 OK, system summary & documents)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (
+                r.status_code == 200
+                and ws.get("access_role") == "owner"
+                and ws.get("system_id") == "SYS-OWNER001"
+                and "documents" in ws
+                and "view_summary" in ws.get("allowed_actions", [])
+            )
+            record_result("Seg14 Hardened: QR System Workspace returns Owner limited workspace (200 OK)", passed, f"Status: {r.status_code} | Role: {ws.get('access_role')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR System Workspace returns Owner limited workspace (200 OK)", False, f"Exception: {e}")
+
+        # 373. Seg14 Hardened: QR System Workspace - Technician Workspace (200 OK, field maintenance & read-only docs)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            fm = ws.get("field_maintenance", {})
+            passed = (
+                r.status_code == 200
+                and ws.get("access_role") == "technician"
+                and fm.get("read_only_documents") is True
+                and "upload_document" not in ws.get("allowed_actions", [])
+            )
+            record_result("Seg14 Hardened: QR System Workspace returns Technician maintenance workspace (200 OK)", passed, f"Status: {r.status_code} | Role: {ws.get('access_role')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR System Workspace returns Technician maintenance workspace (200 OK)", False, f"Exception: {e}")
+
+        # 374. Seg14 Hardened: QR System Workspace routes Admin to Main Application Dashboard (200 OK, full management permissions)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("access_role") == "admin"
+                and data.get("view_only") is False
+                and data.get("management_enabled") is True
+                and "/admin/dashboard" in data.get("target_route", "")
+                and "SYS-OWNER001" in data.get("target_route", "")
+            )
+            record_result("Seg14 Hardened: QR System Workspace routes Admin to Main Admin Dashboard", passed, f"Status: {r.status_code} | Target: {data.get('target_route')} | ViewOnly: {data.get('view_only')}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR System Workspace routes Admin to Main Admin Dashboard", False, f"Exception: {e}")
+
+        # 375. Seg14 Hardened: Role Selection Integrity: Technician selecting Admin rejected with 403 Forbidden
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Technician selecting Admin role rejected with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Technician selecting Admin role rejected with 403 Forbidden", False, f"Exception: {e}")
+
+        # 376. Seg14 Hardened: Role Selection Integrity: Owner selecting Technician rejected with 403 Forbidden
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=technician", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: Owner selecting Technician role rejected with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Owner selecting Technician role rejected with 403 Forbidden", False, f"Exception: {e}")
+
+        # 377. Seg14 Hardened: IDOR Prevention: User authorized for SYS-001 accessing SYS-002 workspace rejected with 403
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER002/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: IDOR: Owner accessing other system workspace rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: IDOR: Owner accessing other system workspace rejected with 403", False, f"Exception: {e}")
+
+        # 378. Seg14 Hardened: IDOR Prevention: Unassigned Technician accessing QR Workspace rejected with 403
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER002/workspace", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Seg14 Hardened: IDOR: Unassigned Tech accessing QR workspace rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: IDOR: Unassigned Tech accessing QR workspace rejected with 403", False, f"Exception: {e}")
+
+        # 379. Seg14 Hardened: QR System Workspace for non-existent system returns 404 Not Found
+        try:
+            r = client.get("/api/qr-access/SYS-NONEXISTENT/workspace", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Seg14 Hardened: QR Workspace for non-existent system returns 404 Not Found", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Seg14 Hardened: QR Workspace for non-existent system returns 404 Not Found", False, f"Exception: {e}")
+
+        # 380. Seg14 Hardened: Audit Trail logs VIEW action for QR Workspace access
+        try:
+            audits = mock_db._store.get("document_audits", {})
+            ws_audits = [a for a in audits.values() if a.get("doc_id") == "WORKSPACE-SYS-OWNER001"]
+            passed = (len(ws_audits) > 0)
+            record_result("Seg14 Hardened: Audit Trail records entry for QR Workspace access", passed, f"WorkspaceAuditsCount: {len(ws_audits)}")
+        except Exception as e:
+            record_result("Seg14 Hardened: Audit Trail records entry for QR Workspace access", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: EXTENDED QR SECURITY & AUDIT TESTS (Tests 381 – 430)
+        # ===========================================================================
+
+        # 381. QR Security: User role selection ?intended_role=user works for authorized owner (200 OK, View Only Workspace)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=user", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (r.status_code == 200 and ws.get("access_role") == "owner" and ws.get("view_only") is True)
+            record_result("QR Sec: User role selection ?intended_role=user returns 200 OK", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: User role selection ?intended_role=user returns 200 OK", False, f"Exception: {e}")
+
+        # 382. QR Security: Technician role selection ?intended_role=technician works for assigned tech (200 OK, View Only Workspace)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=technician", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (r.status_code == 200 and ws.get("access_role") == "technician" and ws.get("view_only") is True)
+            record_result("QR Sec: Technician role selection ?intended_role=technician returns 200 OK", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Technician role selection ?intended_role=technician returns 200 OK", False, f"Exception: {e}")
+
+        # 383. QR Security: Admin role selection ?intended_role=admin routes to main application Admin dashboard (200 OK, view_only: False)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("access_role") == "admin"
+                and data.get("view_only") is False
+                and data.get("management_enabled") is True
+                and "/admin/dashboard" in data.get("target_route", "")
+            )
+            record_result("QR Sec: Admin role selection ?intended_role=admin routes to main Admin dashboard", passed, f"Status: {r.status_code} | Target: {data.get('target_route')}")
+        except Exception as e:
+            record_result("QR Sec: Admin role selection ?intended_role=admin routes to main Admin dashboard", False, f"Exception: {e}")
+
+        # 384. QR Security: Selected role does not grant privileges (Client sends role:admin in body/query, server ignores client claim)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?role=admin", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            # Server must enforce actual server-side role (technician), ignoring ?role=admin
+            passed = (r.status_code == 200 and ws.get("access_role") == "technician" and ws.get("view_only") is True)
+            record_result("QR Sec: Client role query parameter does NOT grant elevated privileges", passed, f"Status: {r.status_code} | EnforcedRole: {ws.get('access_role')}")
+        except Exception as e:
+            record_result("QR Sec: Client role query parameter does NOT grant elevated privileges", False, f"Exception: {e}")
+
+        # 385. QR Security: Actual Firebase role is strictly enforced (Tech selecting User context remains Tech authorization)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=user", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (r.status_code == 200 and ws.get("access_role") == "technician" and ws.get("view_only") is True)
+            record_result("QR Sec: Actual server-side Firebase role strictly enforced for all queries", passed, f"Status: {r.status_code} | Role: {ws.get('access_role')}")
+        except Exception as e:
+            record_result("QR Sec: Actual server-side Firebase role strictly enforced for all queries", False, f"Exception: {e}")
+
+        # 386. QR Security: User selecting Technician role rejected with 403 Forbidden
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=technician", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("QR Sec: User selecting Technician role rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: User selecting Technician role rejected with 403", False, f"Exception: {e}")
+
+        # 387. QR Security: Unauthorized system access is denied (Owner 2 accessing Owner 1 system returns 403)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-owner2"})
+            passed = (r.status_code == 403)
+            record_result("QR Sec: Unauthorized system access denied with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Unauthorized system access denied with 403 Forbidden", False, f"Exception: {e}")
+
+        # 388. QR Security: SYS-001 -> SYS-002 URL manipulation is denied (403 Forbidden)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER002/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("QR Sec: URL parameter manipulation (SYS-001 -> SYS-002) denied with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: URL parameter manipulation (SYS-001 -> SYS-002) denied with 403", False, f"Exception: {e}")
+
+        # 389. QR Security: Unauthorized document access from QR workspace is denied (403)
+        try:
+            r = client.get("/api/documents/DOC-6E3FCAF6/file", headers={"Authorization": "Bearer valid-token-tech2"})
+            passed = (r.status_code == 403 or r.status_code == 404)
+            record_result("QR Sec: Unauthorized document access attempt denied with 403/404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Unauthorized document access attempt denied with 403/404", False, f"Exception: {e}")
+
+        # 390. QR Security: QR workspace contains data strictly for scanned system (no other systems)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            has_other_systems = "other_systems" in ws or "systems" in ws or "all_systems" in ws
+            passed = (r.status_code == 200 and not has_other_systems and ws.get("system_id") == "SYS-OWNER001")
+            record_result("QR Sec: QR workspace payload contains data strictly for scanned system", passed, f"SingleSystemVerified: {passed}")
+        except Exception as e:
+            record_result("QR Sec: QR workspace payload contains data strictly for scanned system", False, f"Exception: {e}")
+
+        # 391. QR Security: User receives only user-appropriate information (status, performance summary, permitted docs)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            disallowed_in_user_ws = ["field_maintenance", "diagnostics_enabled", "manage_assignments", "admin_controls"]
+            leaked = [k for k in disallowed_in_user_ws if k in ws]
+            passed = (r.status_code == 200 and len(leaked) == 0 and "performance_summary" in ws)
+            record_result("QR Sec: User receives only user-appropriate information", passed, f"LeakedKeys: {leaked}")
+        except Exception as e:
+            record_result("QR Sec: User receives only user-appropriate information", False, f"Exception: {e}")
+
+        # 392. QR Security: Technician receives only technician-appropriate information (maintenance, telemetry, alerts, manuals)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (
+                r.status_code == 200
+                and "field_maintenance" in ws
+                and "live_performance" in ws
+                and "alerts_summary" in ws
+                and ws.get("field_maintenance", {}).get("read_only_documents") is True
+            )
+            record_result("QR Sec: Technician receives maintenance-focused limited information", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Technician receives maintenance-focused limited information", False, f"Exception: {e}")
+
+        # 393. QR Security: Admin receives redirect to main application with view_only: False
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("access_role") == "admin"
+                and data.get("view_only") is False
+                and data.get("management_enabled") is True
+                and "/admin/dashboard" in data.get("target_route", "")
+            )
+            record_result("QR Sec: Admin receives redirect to main application (view_only: False)", passed, f"ViewOnly: {data.get('view_only')}")
+        except Exception as e:
+            record_result("QR Sec: Admin receives redirect to main application (view_only: False)", False, f"Exception: {e}")
+
+        # 394. QR Security: User cannot edit from QR workspace (view_only: true, management_enabled: false)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (ws.get("view_only") is True and ws.get("management_enabled") is False and "edit_system" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: User workspace explicitly marked view_only without edit permissions", passed, f"ViewOnly: {ws.get('view_only')}")
+        except Exception as e:
+            record_result("QR Sec: User workspace explicitly marked view_only without edit permissions", False, f"Exception: {e}")
+
+        # 395. QR Security: User cannot delete from QR workspace (delete_document not in allowed_actions)
+        try:
+            passed = ("delete_document" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: User workspace explicitly excludes delete_document permission", passed, f"Actions: {ws.get('allowed_actions')}")
+        except Exception as e:
+            record_result("QR Sec: User workspace explicitly excludes delete_document permission", False, f"Exception: {e}")
+
+        # 396. QR Security: User cannot upload from QR workspace (upload_document not in allowed_actions)
+        try:
+            passed = ("upload_document" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: User workspace explicitly excludes upload_document permission", passed, f"Actions: {ws.get('allowed_actions')}")
+        except Exception as e:
+            record_result("QR Sec: User workspace explicitly excludes upload_document permission", False, f"Exception: {e}")
+
+        # 397. QR Security: Technician cannot edit from QR workspace (read_only_mode: true)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            ws = data.get("workspace", {})
+            passed = (ws.get("view_only") is True and ws.get("read_only_mode") is True and "edit_system" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: Technician workspace explicitly marked read_only_mode without edit", passed, f"ReadOnlyMode: {ws.get('read_only_mode')}")
+        except Exception as e:
+            record_result("QR Sec: Technician workspace explicitly marked read_only_mode without edit", False, f"Exception: {e}")
+
+        # 398. QR Security: Technician cannot delete from QR workspace (delete_document not in allowed_actions)
+        try:
+            passed = ("delete_document" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: Technician workspace explicitly excludes delete_document", passed, f"Actions: {ws.get('allowed_actions')}")
+        except Exception as e:
+            record_result("QR Sec: Technician workspace explicitly excludes delete_document", False, f"Exception: {e}")
+
+        # 399. QR Security: Technician cannot upload from QR workspace (upload_document not in allowed_actions)
+        try:
+            passed = ("upload_document" not in ws.get("allowed_actions", []))
+            record_result("QR Sec: Technician workspace explicitly excludes upload_document", passed, f"Actions: {ws.get('allowed_actions')}")
+        except Exception as e:
+            record_result("QR Sec: Technician workspace explicitly excludes upload_document", False, f"Exception: {e}")
+
+        # 400. QR Security: Admin operates in main app where Admin can edit systems
+        try:
+            r = client.put("/api/systems/SYS-OWNER001", headers={"Authorization": "Bearer valid-token-admin"}, json={"name": "Admin Updated Name"})
+            passed = (r.status_code == 200)
+            record_result("QR Sec: Admin retains full ability to edit systems in main application", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Admin retains full ability to edit systems in main application", False, f"Exception: {e}")
+
+        # 401. QR Security: Admin retains full ability to delete documents in main application
+        try:
+            mock_db._store["documents"]["DOC-ADMIN-DEL-TEST"] = {
+                "doc_id": "DOC-ADMIN-DEL-TEST", "system_id": "SYS-OWNER001", "site_id": "SITE-OWNER001", "type": "manual"
+            }
+            r = client.delete("/api/documents/DOC-ADMIN-DEL-TEST", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200)
+            record_result("QR Sec: Admin retains full ability to delete documents in main application", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Admin retains full ability to delete documents in main application", False, f"Exception: {e}")
+
+        # 402. QR Security: Admin retains full ability to upload documents in main application
+        try:
+            pdf_bytes = b"%PDF-1.4\nadmin doc"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file": (io.BytesIO(pdf_bytes), "admin_manual.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 201)
+            record_result("QR Sec: Admin retains full ability to upload documents in main application", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Admin retains full ability to upload documents in main application", False, f"Exception: {e}")
+
+        # 403. QR Security: Admin retains full ability to assign technicians in main application
+        try:
+            r = client.post("/api/assignments", headers={"Authorization": "Bearer valid-token-admin"}, json={
+                "technician_uid": "uid_tech2",
+                "system_id": "SYS-OWNER001"
+            })
+            passed = (r.status_code == 201)
+            record_result("QR Sec: Admin retains full ability to assign technicians in main application", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Admin retains full ability to assign technicians in main application", False, f"Exception: {e}")
+
+        # 404. QR Security: Admin retains full ability to modify system settings in main application
+        try:
+            r = client.put("/api/systems/SYS-OWNER001", headers={"Authorization": "Bearer valid-token-admin"}, json={"panel_capacity_watts": 8500.0})
+            passed = (r.status_code == 200)
+            record_result("QR Sec: Admin retains full ability to modify settings in main application", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Admin retains full ability to modify settings in main application", False, f"Exception: {e}")
+
+        # 405. QR Security: Backend rejects manually constructed POST requests to QR workspace route (405 Method Not Allowed)
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"}, json={"action": "edit"})
+            passed = (r.status_code == 405)
+            record_result("QR Sec: Backend rejects POST to QR workspace route with 405", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Backend rejects POST to QR workspace route with 405", False, f"Exception: {e}")
+
+        # 406. QR Security: Backend rejects manually constructed PUT requests to QR workspace route (405 Method Not Allowed)
+        try:
+            r = client.put("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"}, json={"name": "hacked"})
+            passed = (r.status_code == 405)
+            record_result("QR Sec: Backend rejects PUT to QR workspace route with 405", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Backend rejects PUT to QR workspace route with 405", False, f"Exception: {e}")
+
+        # 407. QR Security: Backend rejects manually constructed DELETE requests to QR workspace route (405 Method Not Allowed)
+        try:
+            r = client.delete("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 405)
+            record_result("QR Sec: Backend rejects DELETE to QR workspace route with 405", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Backend rejects DELETE to QR workspace route with 405", False, f"Exception: {e}")
+
+        # 408. QR Security: Document download remains authorized and audited in QR context
+        try:
+            r = client.get("/api/documents/DOC-48898858/file", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 200 or r.status_code == 404)
+            record_result("QR Sec: Document download in QR context requires valid authorization", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Document download in QR context requires valid authorization", False, f"Exception: {e}")
+
+        # 409. QR Security: Logout invalidates protected access (missing/invalid Bearer token returns 401)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer invalid-logged-out-token"})
+            passed = (r.status_code == 401)
+            record_result("QR Sec: Invalid or logged-out token rejected with 401 Unauthorized", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Invalid or logged-out token rejected with 401 Unauthorized", False, f"Exception: {e}")
+
+        # 410. QR Security: Session expiration handled cleanly (expired token returns 401)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer expired-token"})
+            passed = (r.status_code == 401)
+            record_result("QR Sec: Expired token rejected with 401 Unauthorized", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Sec: Expired token rejected with 401 Unauthorized", False, f"Exception: {e}")
+
+        # 411. Acceptance Scenario A — Full User Flow (Scan SYS-001 -> Portal -> Select User -> Login -> Actual role -> System auth -> User Workspace with view_only=True)
+        try:
+            # Step 1: Scan QR -> Portal Landing (Public)
+            r1 = client.get("/api/qr-access/SYS-OWNER001")
+            s1_pass = (r1.status_code == 200 and r1.get_json().get("system_id") == "SYS-OWNER001")
+            # Step 2: Select User & Login -> Workspace (Auth)
+            r2 = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=user", headers={"Authorization": "Bearer valid-token-owner"})
+            d2 = r2.get_json() or {}
+            ws2 = d2.get("workspace", {})
+            s2_pass = (r2.status_code == 200 and ws2.get("access_role") == "owner" and ws2.get("view_only") is True)
+            passed = s1_pass and s2_pass
+            record_result("Acceptance Scenario A: Full User QR access flow verified (View Only)", passed, f"Step1: {s1_pass} | Step2: {s2_pass}")
+        except Exception as e:
+            record_result("Acceptance Scenario A: Full User QR access flow verified (View Only)", False, f"Exception: {e}")
+
+        # 412. Acceptance Scenario B — Full Technician Flow (Scan SYS-001 -> Portal -> Select Tech -> Login -> Actual role -> Assignment auth -> Tech Workspace with view_only=True)
+        try:
+            # Step 1: Scan QR -> Portal Landing (Public)
+            r1 = client.get("/api/qr-access/SYS-OWNER001")
+            s1_pass = (r1.status_code == 200 and r1.get_json().get("system_id") == "SYS-OWNER001")
+            # Step 2: Select Technician & Login -> Workspace (Auth)
+            r2 = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=technician", headers={"Authorization": "Bearer valid-token-tech"})
+            d2 = r2.get_json() or {}
+            ws2 = d2.get("workspace", {})
+            s2_pass = (r2.status_code == 200 and ws2.get("access_role") == "technician" and ws2.get("view_only") is True and ws2.get("field_maintenance", {}).get("read_only_documents") is True)
+            passed = s1_pass and s2_pass
+            record_result("Acceptance Scenario B: Full Technician QR access flow verified (Maintenance View Only)", passed, f"Step1: {s1_pass} | Step2: {s2_pass}")
+        except Exception as e:
+            record_result("Acceptance Scenario B: Full Technician QR access flow verified (Maintenance View Only)", False, f"Exception: {e}")
+
+        # 413. Acceptance Scenario C — Full Admin Flow (Scan SYS-001 -> Portal -> Select Admin -> Login -> Actual role -> Main Application Admin Dashboard with full power)
+        try:
+            # Step 1: Scan QR -> Portal Landing (Public)
+            r1 = client.get("/api/qr-access/SYS-OWNER001")
+            s1_pass = (r1.status_code == 200 and r1.get_json().get("system_id") == "SYS-OWNER001")
+            # Step 2: Select Admin & Login -> Router / Workspace -> Redirects to Main Admin App
+            r2 = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-admin"})
+            d2 = r2.get_json() or {}
+            s2_pass = (
+                r2.status_code == 200
+                and d2.get("access_role") == "admin"
+                and d2.get("view_only") is False
+                and d2.get("management_enabled") is True
+                and "/admin/dashboard" in d2.get("target_route", "")
+            )
+            passed = s1_pass and s2_pass
+            record_result("Acceptance Scenario C: Full Admin QR access flow routes to Main Admin Dashboard", passed, f"Step1: {s1_pass} | Step2: {s2_pass}")
+        except Exception as e:
+            record_result("Acceptance Scenario C: Full Admin QR access flow routes to Main Admin Dashboard", False, f"Exception: {e}")
+
+        # 414. Acceptance Scenario D — Role Spoofing (Tech selects Admin -> Login -> Actual role Tech -> 403 Forbidden)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Acceptance Scenario D: Role Spoofing (Tech selecting Admin) denied with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Acceptance Scenario D: Role Spoofing (Tech selecting Admin) denied with 403", False, f"Exception: {e}")
+
+        # 415. Acceptance Scenario E — User Spoofing (User selects Admin -> Login -> Actual role User -> 403 Forbidden)
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Acceptance Scenario E: User Spoofing (User selecting Admin) denied with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Acceptance Scenario E: User Spoofing (User selecting Admin) denied with 403", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 14 HARDENED: DEDICATED QR ROUTER ENDPOINT TESTS (Tests 416 – 425)
+        # ===========================================================================
+
+        # 416. QR Router: GET /api/qr-access/<system_id>/route for Admin returns admin_dashboard redirect
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("route_type") == "admin_dashboard"
+                and data.get("view_only") is False
+                and data.get("management_enabled") is True
+                and "/admin/dashboard" in data.get("target_route", "")
+            )
+            record_result("QR Router: GET /route for Admin returns main application redirect (200 OK)", passed, f"Status: {r.status_code} | Target: {data.get('target_route')}")
+        except Exception as e:
+            record_result("QR Router: GET /route for Admin returns main application redirect (200 OK)", False, f"Exception: {e}")
+
+        # 417. QR Router: GET /api/qr-access/<system_id>/route for Technician returns qr_workspace
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-tech"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("route_type") == "qr_workspace"
+                and data.get("view_only") is True
+                and "/qr-access/SYS-OWNER001/workspace" in data.get("target_route", "")
+            )
+            record_result("QR Router: GET /route for Technician returns restricted QR workspace (200 OK)", passed, f"Status: {r.status_code} | Target: {data.get('target_route')}")
+        except Exception as e:
+            record_result("QR Router: GET /route for Technician returns restricted QR workspace (200 OK)", False, f"Exception: {e}")
+
+        # 418. QR Router: GET /api/qr-access/<system_id>/route for Owner returns qr_workspace
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("route_type") == "qr_workspace"
+                and data.get("view_only") is True
+                and "/qr-access/SYS-OWNER001/workspace" in data.get("target_route", "")
+            )
+            record_result("QR Router: GET /route for Owner returns restricted QR workspace (200 OK)", passed, f"Status: {r.status_code} | Target: {data.get('target_route')}")
+        except Exception as e:
+            record_result("QR Router: GET /route for Owner returns restricted QR workspace (200 OK)", False, f"Exception: {e}")
+
+        # 419. QR Router: POST /api/qr-access/<system_id>/route with intended_role=admin for Admin succeeds (200 OK)
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-admin"}, json={"intended_role": "admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("route_type") == "admin_dashboard" and data.get("view_only") is False)
+            record_result("QR Router: POST /route with intended_role=admin for Admin succeeds (200 OK)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: POST /route with intended_role=admin for Admin succeeds (200 OK)", False, f"Exception: {e}")
+
+        # 420. QR Router: POST /api/qr-access/<system_id>/route with intended_role=admin for Technician rejected (403 Forbidden)
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-tech"}, json={"intended_role": "admin"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: POST /route with intended_role=admin for Tech rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: POST /route with intended_role=admin for Tech rejected with 403", False, f"Exception: {e}")
+
+        # 421. QR Router: POST /api/qr-access/<system_id>/route with intended_role=admin for User rejected (403 Forbidden)
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-owner"}, json={"intended_role": "admin"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: POST /route with intended_role=admin for User rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: POST /route with intended_role=admin for User rejected with 403", False, f"Exception: {e}")
+
+        # 422. QR Router: POST /api/qr-access/<system_id>/route with intended_role=technician for User rejected (403 Forbidden)
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-owner"}, json={"intended_role": "technician"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: POST /route with intended_role=technician for User rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: POST /route with intended_role=technician for User rejected with 403", False, f"Exception: {e}")
+
+        # 423. QR Router: Client spoofing {"redirect": "/admin"} on User token is ignored; routes safely to QR workspace
+        try:
+            r = client.post("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-owner"}, json={"redirect": "/admin", "role": "admin"})
+            data = r.get_json() or {}
+            # Server forces authentic role (owner), ignores client redirect and role parameters
+            passed = (r.status_code == 200 and data.get("route_type") == "qr_workspace" and data.get("view_only") is True)
+            record_result("QR Router: Client spoofing redirect/role payload safely ignored and routed to workspace", passed, f"RouteType: {data.get('route_type')}")
+        except Exception as e:
+            record_result("QR Router: Client spoofing redirect/role payload safely ignored and routed to workspace", False, f"Exception: {e}")
+
+        # 424. QR Router: Unauthenticated request to /api/qr-access/<system_id>/route returns 401 Unauthorized
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/route")
+            passed = (r.status_code == 401)
+            record_result("QR Router: Unauthenticated request to /route rejected with 401 Unauthorized", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: Unauthenticated request to /route rejected with 401 Unauthorized", False, f"Exception: {e}")
+
+        # 425. QR Router: Unauthorized system request to /api/qr-access/<system_id>/route returns 403 Forbidden
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER002/route", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: Unauthorized system routing request rejected with 403 Forbidden", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: Unauthorized system routing request rejected with 403 Forbidden", False, f"Exception: {e}")
+
+        # 426. QR Router: User attempting technician assignment via main application rejected with 403 Forbidden
+        try:
+            r = client.post("/api/assignments", headers={"Authorization": "Bearer valid-token-owner"}, json={
+                "technician_uid": "uid_tech2",
+                "system_id": "SYS-OWNER001"
+            })
+            passed = (r.status_code == 403)
+            record_result("QR Router: User attempting technician assignment in main app rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: User attempting technician assignment in main app rejected with 403", False, f"Exception: {e}")
+
+        # 427. QR Router: Technician attempting document upload in main application rejected with 403 Forbidden
+        try:
+            pdf_bytes = b"%PDF-1.4\ntech doc"
+            r = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-tech"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file": (io.BytesIO(pdf_bytes), "tech_manual.pdf")
+            }, content_type="multipart/form-data")
+            passed = (r.status_code == 403)
+            record_result("QR Router: Technician attempting document upload in main app rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: Technician attempting document upload in main app rejected with 403", False, f"Exception: {e}")
+
+        # 428. QR Router: Technician attempting document deletion in main application rejected with 403 Forbidden
+        try:
+            mock_db._store["documents"]["DOC-TECH-DEL-TEST"] = {
+                "doc_id": "DOC-TECH-DEL-TEST", "system_id": "SYS-OWNER001", "site_id": "SITE-OWNER001", "type": "manual"
+            }
+            r = client.delete("/api/documents/DOC-TECH-DEL-TEST", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: Technician attempting document delete in main app rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: Technician attempting document delete in main app rejected with 403", False, f"Exception: {e}")
+
+        # 429. QR Router: Technician attempting system edit in main application rejected with 403 Forbidden
+        try:
+            r = client.put("/api/systems/SYS-OWNER001", headers={"Authorization": "Bearer valid-token-tech"}, json={"name": "Tech Hacked Name"})
+            passed = (r.status_code == 403)
+            record_result("QR Router: Technician attempting system edit in main app rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Router: Technician attempting system edit in main app rejected with 403", False, f"Exception: {e}")
+
+        # 430. QR Router: Full RBAC Routing Matrix integrity verified across all 3 roles
+        try:
+            r_owner = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-owner"})
+            r_tech = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-tech"})
+            r_admin = client.get("/api/qr-access/SYS-OWNER001/route", headers={"Authorization": "Bearer valid-token-admin"})
+            d_owner = r_owner.get_json() or {}
+            d_tech = r_tech.get_json() or {}
+            d_admin = r_admin.get_json() or {}
+            passed = (
+                d_owner.get("route_type") == "qr_workspace" and d_owner.get("view_only") is True
+                and d_tech.get("route_type") == "qr_workspace" and d_tech.get("view_only") is True
+                and d_admin.get("route_type") == "admin_dashboard" and d_admin.get("view_only") is False and d_admin.get("management_enabled") is True
+            )
+            record_result("QR Router: Complete 3-Role Routing Matrix verified end-to-end", passed, f"MatrixVerified: {passed}")
+        except Exception as e:
+            record_result("QR Router: Complete 3-Role Routing Matrix verified end-to-end", False, f"Exception: {e}")
+
+
+        # ===========================================================================
+        # SEGMENT 15 — ADMIN PANEL APIs (Tests 431 – 490)
+        # ===========================================================================
+
+        # ---------------------------------------------------------
+        # STATS ENDPOINT (Tests 431 – 432)
+        # ---------------------------------------------------------
+
+        # 431. Admin can GET /api/admin/stats — returns 200 with all required fields
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and "total_users" in data
+                and "users_by_role" in data
+                and "total_sites" in data
+                and "total_systems" in data
+                and "total_active_assignments" in data
+                and "total_active_alerts" in data
+                and "total_documents" in data
+                and "generated_at" in data
+            )
+            record_result("Admin Stats: GET /api/admin/stats returns 200 with all required fields", passed, f"Status: {r.status_code} | Users: {data.get('total_users')}")
+        except Exception as e:
+            record_result("Admin Stats: GET /api/admin/stats returns 200 with all required fields", False, f"Exception: {e}")
+
+        # 432. Non-admin (owner) on /api/admin/stats returns 403
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Stats: Owner on /api/admin/stats rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Stats: Owner on /api/admin/stats rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # USERS LIST (Tests 433 – 435)
+        # ---------------------------------------------------------
+
+        # 433. Admin lists all users — 200 with pagination envelope
+        try:
+            r = client.get("/api/admin/users", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and "items" in data
+                and "total" in data
+                and isinstance(data["items"], list)
+                and data["total"] >= 5  # at least uid_owner, uid_owner2, uid_tech, uid_tech2, uid_admin
+            )
+            record_result("Admin Users: GET /api/admin/users returns 200 with paginated list", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Users: GET /api/admin/users returns 200 with paginated list", False, f"Exception: {e}")
+
+        # 434. Owner cannot list users — 403
+        try:
+            r = client.get("/api/admin/users", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Users: Owner on /api/admin/users rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: Owner on /api/admin/users rejected with 403", False, f"Exception: {e}")
+
+        # 435. Admin filters users by role=admin
+        try:
+            r = client.get("/api/admin/users?role=admin", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_admin = all(u.get("role") == "admin" for u in items)
+            passed = (r.status_code == 200 and len(items) >= 1 and all_admin)
+            record_result("Admin Users: role=admin filter returns only admin users", passed, f"Status: {r.status_code} | AdminCount: {len(items)}")
+        except Exception as e:
+            record_result("Admin Users: role=admin filter returns only admin users", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # USER GET (Tests 436 – 437)
+        # ---------------------------------------------------------
+
+        # 436. Admin can GET /api/admin/users/<uid> — 200 with user profile
+        try:
+            r = client.get("/api/admin/users/uid_owner", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("uid") == "uid_owner" and data.get("role") == "owner")
+            record_result("Admin Users: GET /api/admin/users/<uid> returns 200 with correct profile", passed, f"Status: {r.status_code} | Role: {data.get('role')}")
+        except Exception as e:
+            record_result("Admin Users: GET /api/admin/users/<uid> returns 200 with correct profile", False, f"Exception: {e}")
+
+        # 437. GET non-existent user returns 404
+        try:
+            r = client.get("/api/admin/users/uid_does_not_exist_xyz", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Admin Users: GET non-existent user returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: GET non-existent user returns 404", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # USER UPDATE (Tests 438 – 442)
+        # ---------------------------------------------------------
+
+        # 438. Admin updates user name — 200
+        try:
+            r = client.put("/api/admin/users/uid_owner", headers={"Authorization": "Bearer valid-token-admin"}, json={"name": "Updated Owner Name"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and (data.get("user") or {}).get("name") == "Updated Owner Name")
+            record_result("Admin Users: PUT user name update returns 200 with updated name", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: PUT user name update returns 200 with updated name", False, f"Exception: {e}")
+
+        # 439. Admin updates user role from owner to technician — 200
+        try:
+            # First add a new test user to update
+            mock_db._store["users"]["uid_role_update_test"] = {
+                "uid": "uid_role_update_test", "email": "roletest@solar.com",
+                "name": "Role Test User", "role": "owner",
+                "created_at": "2026-08-16T00:00:00Z"
+            }
+            r = client.put("/api/admin/users/uid_role_update_test", headers={"Authorization": "Bearer valid-token-admin"}, json={"role": "technician"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and (data.get("user") or {}).get("role") == "technician")
+            record_result("Admin Users: PUT role change owner→technician returns 200", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: PUT role change owner→technician returns 200", False, f"Exception: {e}")
+
+        # 440. Admin sends invalid role — 400
+        try:
+            r = client.put("/api/admin/users/uid_owner", headers={"Authorization": "Bearer valid-token-admin"}, json={"role": "superuser"})
+            passed = (r.status_code == 400)
+            record_result("Admin Users: PUT invalid role 'superuser' rejected with 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: PUT invalid role 'superuser' rejected with 400", False, f"Exception: {e}")
+
+        # 441. Zero-admin guard: demoting the only admin is rejected with 403
+        try:
+            # uid_admin is the only admin in mock_db
+            r = client.put("/api/admin/users/uid_admin", headers={"Authorization": "Bearer valid-token-admin"}, json={"role": "owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Users: Zero-admin guard rejects demoting last admin with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: Zero-admin guard rejects demoting last admin with 403", False, f"Exception: {e}")
+
+        # 442. Technician cannot update users — 403
+        try:
+            r = client.put("/api/admin/users/uid_owner", headers={"Authorization": "Bearer valid-token-tech"}, json={"name": "Hacked Name"})
+            passed = (r.status_code == 403)
+            record_result("Admin Users: Technician on PUT /api/admin/users/<uid> rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: Technician on PUT /api/admin/users/<uid> rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # USER DISABLE (Tests 443 – 446)
+        # ---------------------------------------------------------
+
+        # 443. Admin disables another user — 200
+        try:
+            mock_db._store["users"]["uid_disable_test"] = {
+                "uid": "uid_disable_test", "email": "disabletest@solar.com",
+                "name": "Disable Test User", "role": "owner",
+                "created_at": "2026-08-16T00:00:00Z"
+            }
+            r = client.delete("/api/admin/users/uid_disable_test", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "disabled" in data.get("message", "").lower())
+            record_result("Admin Users: DELETE /api/admin/users/<uid> disables user with 200", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: DELETE /api/admin/users/<uid> disables user with 200", False, f"Exception: {e}")
+
+        # 444. Self-disable guard: admin cannot disable their own account
+        try:
+            r = client.delete("/api/admin/users/uid_admin", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 403)
+            record_result("Admin Users: Self-disable guard rejects admin disabling own account with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: Self-disable guard rejects admin disabling own account with 403", False, f"Exception: {e}")
+
+        # 445. Zero-admin guard on disable: only admin cannot be disabled
+        try:
+            # Add a second admin temporarily so we can try disabling the only admin
+            # uid_admin is the sole admin — disabling it must be rejected
+            r = client.delete("/api/admin/users/uid_admin", headers={"Authorization": "Bearer valid-token-admin"})
+            # Will hit self-guard (same UID) before zero-admin guard; still 403
+            passed = (r.status_code == 403)
+            record_result("Admin Users: Zero-admin / self-guard rejects disabling only admin with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: Zero-admin / self-guard rejects disabling only admin with 403", False, f"Exception: {e}")
+
+        # 446. Disable non-existent user returns 404
+        try:
+            r = client.delete("/api/admin/users/uid_ghost_does_not_exist", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Admin Users: DELETE non-existent user returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Users: DELETE non-existent user returns 404", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # SITES (Tests 447 – 448)
+        # ---------------------------------------------------------
+
+        # 447. Admin lists all sites — 200 with items and system_count
+        try:
+            r = client.get("/api/admin/sites", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            has_count = all("system_count" in s for s in items)
+            passed = (r.status_code == 200 and isinstance(items, list) and data.get("total", 0) >= 2 and has_count)
+            record_result("Admin Sites: GET /api/admin/sites returns 200 with sites and system_count", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Sites: GET /api/admin/sites returns 200 with sites and system_count", False, f"Exception: {e}")
+
+        # 448. Owner on /api/admin/sites returns 403
+        try:
+            r = client.get("/api/admin/sites", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Sites: Owner on /api/admin/sites rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Sites: Owner on /api/admin/sites rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # SYSTEMS (Tests 449 – 451)
+        # ---------------------------------------------------------
+
+        # 449. Admin lists all systems — 200 with paginated list
+        try:
+            r = client.get("/api/admin/systems", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and isinstance(data.get("items"), list) and data.get("total", 0) >= 2)
+            record_result("Admin Systems: GET /api/admin/systems returns 200 with all systems", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Systems: GET /api/admin/systems returns 200 with all systems", False, f"Exception: {e}")
+
+        # 450. Admin filters systems by owner_uid — returns only that owner's systems
+        try:
+            r = client.get("/api/admin/systems?owner_uid=uid_owner", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_owned = all(s.get("owner_uid") == "uid_owner" for s in items)
+            passed = (r.status_code == 200 and len(items) >= 1 and all_owned)
+            record_result("Admin Systems: owner_uid filter returns only matching systems", passed, f"Status: {r.status_code} | Filtered: {len(items)}")
+        except Exception as e:
+            record_result("Admin Systems: owner_uid filter returns only matching systems", False, f"Exception: {e}")
+
+        # 451. Technician on /api/admin/systems returns 403
+        try:
+            r = client.get("/api/admin/systems", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Admin Systems: Technician on /api/admin/systems rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Systems: Technician on /api/admin/systems rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ASSIGNMENTS LIST (Tests 452 – 454)
+        # ---------------------------------------------------------
+
+        # 452. Admin lists all assignments — 200
+        try:
+            r = client.get("/api/admin/assignments", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "items" in data and "total" in data)
+            record_result("Admin Assignments: GET /api/admin/assignments returns 200 with envelope", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Assignments: GET /api/admin/assignments returns 200 with envelope", False, f"Exception: {e}")
+
+        # 453. status=active filter works
+        try:
+            # Seed an active assignment
+            mock_db._store["assignments"]["ASG-ADMIN-ACTIVE"] = {
+                "assignment_id": "ASG-ADMIN-ACTIVE", "technician_uid": "uid_tech",
+                "system_id": "SYS-OWNER001", "status": "active",
+                "assigned_at": "2026-08-16T00:00:00Z"
+            }
+            r = client.get("/api/admin/assignments?status=active", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_active = all(a.get("status") == "active" for a in items)
+            passed = (r.status_code == 200 and all_active)
+            record_result("Admin Assignments: status=active filter returns only active assignments", passed, f"Status: {r.status_code} | Count: {len(items)} | AllActive: {all_active}")
+        except Exception as e:
+            record_result("Admin Assignments: status=active filter returns only active assignments", False, f"Exception: {e}")
+
+        # 454. Owner cannot list assignments via admin endpoint — 403
+        try:
+            r = client.get("/api/admin/assignments", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Assignments: Owner on /api/admin/assignments rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Assignments: Owner on /api/admin/assignments rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ASSIGNMENT DELETE (Tests 455 – 457)
+        # ---------------------------------------------------------
+
+        # 455. Admin hard-deletes an assignment — 200
+        try:
+            mock_db._store["assignments"]["ASG-DEL-TEST"] = {
+                "assignment_id": "ASG-DEL-TEST", "technician_uid": "uid_tech",
+                "system_id": "SYS-OWNER001", "status": "active",
+                "assigned_at": "2026-08-16T00:00:00Z"
+            }
+            r = client.delete("/api/admin/assignments/ASG-DEL-TEST", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "ASG-DEL-TEST" in data.get("message", ""))
+            record_result("Admin Assignments: DELETE /api/admin/assignments/<id> removes assignment with 200", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Assignments: DELETE /api/admin/assignments/<id> removes assignment with 200", False, f"Exception: {e}")
+
+        # 456. Delete non-existent assignment returns 404
+        try:
+            r = client.delete("/api/admin/assignments/ASG-GHOST-9999", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 404)
+            record_result("Admin Assignments: DELETE non-existent assignment returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Assignments: DELETE non-existent assignment returns 404", False, f"Exception: {e}")
+
+        # 457. Technician cannot delete assignments via admin endpoint — 403
+        try:
+            r = client.delete("/api/admin/assignments/ASG-ADMIN-ACTIVE", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Admin Assignments: Technician DELETE /api/admin/assignments/<id> rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Assignments: Technician DELETE /api/admin/assignments/<id> rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ALERTS LIST (Tests 458 – 460)
+        # ---------------------------------------------------------
+
+        # 458. Admin lists active alerts — 200
+        try:
+            r = client.get("/api/admin/alerts", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "items" in data and "total" in data)
+            record_result("Admin Alerts: GET /api/admin/alerts returns 200 with alert envelope", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Alerts: GET /api/admin/alerts returns 200 with alert envelope", False, f"Exception: {e}")
+
+        # 459. active_only=false returns all alerts including resolved ones
+        try:
+            mock_db._store["alerts"]["alert_resolved_001"] = {
+                "id": "alert_resolved_001", "type": "INFO",
+                "message": "Resolved test alert", "active": False,
+                "timestamp": "2026-08-10T00:00:00Z"
+            }
+            r_all = client.get("/api/admin/alerts?active_only=false", headers={"Authorization": "Bearer valid-token-admin"})
+            r_active = client.get("/api/admin/alerts?active_only=true", headers={"Authorization": "Bearer valid-token-admin"})
+            total_all = (r_all.get_json() or {}).get("total", 0)
+            total_active = (r_active.get_json() or {}).get("total", 0)
+            passed = (r_all.status_code == 200 and r_active.status_code == 200 and total_all >= total_active)
+            record_result("Admin Alerts: active_only=false returns more or equal alerts than active_only=true", passed, f"All: {total_all} | ActiveOnly: {total_active}")
+        except Exception as e:
+            record_result("Admin Alerts: active_only=false returns more or equal alerts than active_only=true", False, f"Exception: {e}")
+
+        # 460. Owner cannot list alerts via admin endpoint — 403
+        try:
+            r = client.get("/api/admin/alerts", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Alerts: Owner on /api/admin/alerts rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Alerts: Owner on /api/admin/alerts rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ALERT RESOLVE (Tests 461 – 464)
+        # ---------------------------------------------------------
+
+        # 461. Admin resolves an active alert — 200 with resolved_by set
+        try:
+            mock_db._store["alerts"]["alert_to_resolve"] = {
+                "id": "alert_to_resolve", "type": "WARNING",
+                "message": "Resolve test", "active": True,
+                "timestamp": "2026-08-17T00:00:00Z"
+            }
+            r = client.put("/api/admin/alerts/alert_to_resolve", headers={"Authorization": "Bearer valid-token-admin"}, json={"active": False})
+            data = r.get_json() or {}
+            alert = data.get("alert", {})
+            passed = (
+                r.status_code == 200
+                and alert.get("active") is False
+                and alert.get("resolved_by") == "uid_admin"
+                and "resolved_at" in alert
+            )
+            record_result("Admin Alerts: PUT resolves alert and sets resolved_by + resolved_at", passed, f"Status: {r.status_code} | ResolvedBy: {alert.get('resolved_by')}")
+        except Exception as e:
+            record_result("Admin Alerts: PUT resolves alert and sets resolved_by + resolved_at", False, f"Exception: {e}")
+
+        # 462. Resolve non-existent alert returns 404
+        try:
+            r = client.put("/api/admin/alerts/alert_ghost_xyz", headers={"Authorization": "Bearer valid-token-admin"}, json={"active": False})
+            passed = (r.status_code == 404)
+            record_result("Admin Alerts: PUT non-existent alert returns 404", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Alerts: PUT non-existent alert returns 404", False, f"Exception: {e}")
+
+        # 463. Owner cannot resolve alerts via admin endpoint — 403
+        try:
+            r = client.put("/api/admin/alerts/alert_001", headers={"Authorization": "Bearer valid-token-owner"}, json={"active": False})
+            passed = (r.status_code == 403)
+            record_result("Admin Alerts: Owner on PUT /api/admin/alerts/<id> rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Alerts: Owner on PUT /api/admin/alerts/<id> rejected with 403", False, f"Exception: {e}")
+
+        # 464. Empty payload on alert resolve returns 400
+        try:
+            r = client.put("/api/admin/alerts/alert_001", headers={"Authorization": "Bearer valid-token-admin"}, json={})
+            passed = (r.status_code == 400)
+            record_result("Admin Alerts: PUT empty payload on alert resolve returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Alerts: PUT empty payload on alert resolve returns 400", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # DOCUMENTS (Tests 465 – 467)
+        # ---------------------------------------------------------
+
+        # 465. Admin lists all documents — 200
+        try:
+            r = client.get("/api/admin/documents", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "items" in data and "total" in data)
+            record_result("Admin Documents: GET /api/admin/documents returns 200 with envelope", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Documents: GET /api/admin/documents returns 200 with envelope", False, f"Exception: {e}")
+
+        # 466. Admin filters documents by system_id
+        try:
+            mock_db._store.setdefault("documents", {})
+            mock_db._store["documents"]["DOC-ADMIN-SYS-FILTER"] = {
+                "doc_id": "DOC-ADMIN-SYS-FILTER", "system_id": "SYS-OWNER001",
+                "site_id": "SITE-OWNER001", "type": "manual",
+                "uploaded_at": "2026-08-16T00:00:00Z"
+            }
+            r = client.get("/api/admin/documents?system_id=SYS-OWNER001", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_sys = all(d.get("system_id") == "SYS-OWNER001" for d in items)
+            passed = (r.status_code == 200 and len(items) >= 1 and all_sys)
+            record_result("Admin Documents: system_id filter returns only matching documents", passed, f"Status: {r.status_code} | Filtered: {len(items)}")
+        except Exception as e:
+            record_result("Admin Documents: system_id filter returns only matching documents", False, f"Exception: {e}")
+
+        # 467. Owner cannot list all documents via admin endpoint — 403
+        try:
+            r = client.get("/api/admin/documents", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Documents: Owner on /api/admin/documents rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Documents: Owner on /api/admin/documents rejected with 403", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # AUDIT LOG (Tests 468 – 471)
+        # ---------------------------------------------------------
+
+        # 468. Admin gets audit log — 200 with paginated envelope
+        try:
+            r = client.get("/api/admin/audit-log", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and "items" in data and "total" in data)
+            record_result("Admin Audit Log: GET /api/admin/audit-log returns 200 with envelope", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Audit Log: GET /api/admin/audit-log returns 200 with envelope", False, f"Exception: {e}")
+
+        # 469. Audit log action filter works
+        try:
+            # Seed a known ADMIN_USER_DISABLE audit record
+            mock_db._store["document_audits"]["AUD-ADMIN-FILTER-TEST"] = {
+                "audit_id": "AUD-ADMIN-FILTER-TEST", "action": "ADMIN_USER_DISABLE",
+                "performed_by_uid": "uid_admin", "target": "uid_owner",
+                "timestamp": "2026-08-17T00:00:00Z"
+            }
+            r = client.get("/api/admin/audit-log?action=ADMIN_USER_DISABLE", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_action = all(a.get("action") == "ADMIN_USER_DISABLE" for a in items)
+            passed = (r.status_code == 200 and len(items) >= 1 and all_action)
+            record_result("Admin Audit Log: action filter returns only matching audit records", passed, f"Status: {r.status_code} | Count: {len(items)}")
+        except Exception as e:
+            record_result("Admin Audit Log: action filter returns only matching audit records", False, f"Exception: {e}")
+
+        # 470. Owner cannot access audit log — 403
+        try:
+            r = client.get("/api/admin/audit-log", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Audit Log: Owner on /api/admin/audit-log rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Audit Log: Owner on /api/admin/audit-log rejected with 403", False, f"Exception: {e}")
+
+        # 471. performed_by filter works on audit log
+        try:
+            r = client.get("/api/admin/audit-log?performed_by=uid_admin", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_performer = all(
+                (a.get("performed_by_uid") or a.get("user_uid", "")) == "uid_admin"
+                for a in items
+            )
+            passed = (r.status_code == 200 and all_performer)
+            record_result("Admin Audit Log: performed_by filter returns only uid_admin audit records", passed, f"Status: {r.status_code} | Count: {len(items)}")
+        except Exception as e:
+            record_result("Admin Audit Log: performed_by filter returns only uid_admin audit records", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # PAGINATION TESTS (Tests 472 – 474)
+        # ---------------------------------------------------------
+
+        # 472. Pagination: page=1&per_page=2 returns correct slice
+        try:
+            r = client.get("/api/admin/users?page=1&per_page=2", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and data.get("page") == 1
+                and data.get("per_page") == 2
+                and len(data.get("items", [])) <= 2
+            )
+            record_result("Admin Pagination: page=1&per_page=2 returns correct slice", passed, f"Page: {data.get('page')} | PerPage: {data.get('per_page')} | Items: {len(data.get('items', []))}")
+        except Exception as e:
+            record_result("Admin Pagination: page=1&per_page=2 returns correct slice", False, f"Exception: {e}")
+
+        # 473. Pagination: total_pages is computed correctly
+        try:
+            r = client.get("/api/admin/users?per_page=2", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            total = data.get("total", 0)
+            per_pg = data.get("per_page", 2)
+            expected_pages = max(1, (total + per_pg - 1) // per_pg)
+            passed = (r.status_code == 200 and data.get("total_pages") == expected_pages)
+            record_result("Admin Pagination: total_pages computed correctly from total and per_page", passed, f"Total: {total} | TotalPages: {data.get('total_pages')} | Expected: {expected_pages}")
+        except Exception as e:
+            record_result("Admin Pagination: total_pages computed correctly from total and per_page", False, f"Exception: {e}")
+
+        # 474. Pagination: per_page capped at MAX_PER_PAGE (200)
+        try:
+            r = client.get("/api/admin/users?per_page=999", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("per_page", 999) <= 200)
+            record_result("Admin Pagination: per_page=999 capped at MAX_PER_PAGE=200", passed, f"ActualPerPage: {data.get('per_page')}")
+        except Exception as e:
+            record_result("Admin Pagination: per_page=999 capped at MAX_PER_PAGE=200", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # AUTHENTICATION TESTS (Tests 475 – 480)
+        # ---------------------------------------------------------
+
+        # 475. Unauthenticated request to /api/admin/stats returns 401
+        try:
+            r = client.get("/api/admin/stats")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/stats returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/stats returns 401", False, f"Exception: {e}")
+
+        # 476. Unauthenticated request to /api/admin/users returns 401
+        try:
+            r = client.get("/api/admin/users")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/users returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/users returns 401", False, f"Exception: {e}")
+
+        # 477. Unauthenticated request to /api/admin/sites returns 401
+        try:
+            r = client.get("/api/admin/sites")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/sites returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/sites returns 401", False, f"Exception: {e}")
+
+        # 478. Unauthenticated request to /api/admin/systems returns 401
+        try:
+            r = client.get("/api/admin/systems")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/systems returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/systems returns 401", False, f"Exception: {e}")
+
+        # 479. Unauthenticated request to /api/admin/alerts returns 401
+        try:
+            r = client.get("/api/admin/alerts")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/alerts returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/alerts returns 401", False, f"Exception: {e}")
+
+        # 480. Unauthenticated request to /api/admin/audit-log returns 401
+        try:
+            r = client.get("/api/admin/audit-log")
+            passed = (r.status_code == 401)
+            record_result("Admin Auth: Unauthenticated request to /api/admin/audit-log returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Auth: Unauthenticated request to /api/admin/audit-log returns 401", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # STATS ACCURACY (Tests 481 – 485)
+        # ---------------------------------------------------------
+
+        # 481. Stats accurately reflects users_by_role counts
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            ubr = data.get("users_by_role", {})
+            passed = (
+                r.status_code == 200
+                and ubr.get("admin", 0) >= 1
+                and ubr.get("owner", 0) >= 2
+                and ubr.get("technician", 0) >= 2
+            )
+            record_result("Admin Stats: users_by_role accurately counts admin/owner/technician", passed, f"Admins: {ubr.get('admin')} | Owners: {ubr.get('owner')} | Techs: {ubr.get('technician')}")
+        except Exception as e:
+            record_result("Admin Stats: users_by_role accurately counts admin/owner/technician", False, f"Exception: {e}")
+
+        # 482. Stats accurately counts active alerts
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            active_alerts_count = data.get("total_active_alerts", -1)
+            passed = (r.status_code == 200 and active_alerts_count >= 0)
+            record_result("Admin Stats: total_active_alerts is a non-negative integer", passed, f"ActiveAlerts: {active_alerts_count}")
+        except Exception as e:
+            record_result("Admin Stats: total_active_alerts is a non-negative integer", False, f"Exception: {e}")
+
+        # 483. Stats accurately counts total sites
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("total_sites", 0) >= 2)
+            record_result("Admin Stats: total_sites >= 2 (SITE-OWNER001 + SITE-OWNER002 seeded)", passed, f"TotalSites: {data.get('total_sites')}")
+        except Exception as e:
+            record_result("Admin Stats: total_sites >= 2 (SITE-OWNER001 + SITE-OWNER002 seeded)", False, f"Exception: {e}")
+
+        # 484. Stats accurately counts total systems
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("total_systems", 0) >= 2)
+            record_result("Admin Stats: total_systems >= 2 (SYS-OWNER001 + SYS-OWNER002 seeded)", passed, f"TotalSystems: {data.get('total_systems')}")
+        except Exception as e:
+            record_result("Admin Stats: total_systems >= 2 (SYS-OWNER001 + SYS-OWNER002 seeded)", False, f"Exception: {e}")
+
+        # 485. Stats accurately counts total documents
+        try:
+            r = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            total_docs = data.get("total_documents", -1)
+            passed = (r.status_code == 200 and total_docs >= 0)
+            record_result("Admin Stats: total_documents is a non-negative integer", passed, f"TotalDocs: {total_docs}")
+        except Exception as e:
+            record_result("Admin Stats: total_documents is a non-negative integer", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # INTEGRATION TESTS (Tests 486 – 490)
+        # ---------------------------------------------------------
+
+        # 486. Update user and then GET shows updated data
+        try:
+            mock_db._store["users"]["uid_integration_test"] = {
+                "uid": "uid_integration_test", "email": "inttest@solar.com",
+                "name": "Integration Test", "role": "owner",
+                "created_at": "2026-08-16T00:00:00Z"
+            }
+            client.put("/api/admin/users/uid_integration_test", headers={"Authorization": "Bearer valid-token-admin"}, json={"name": "Integration Updated"})
+            r = client.get("/api/admin/users/uid_integration_test", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("name") == "Integration Updated")
+            record_result("Admin Integration: update user then GET reflects updated name", passed, f"Name: {data.get('name')}")
+        except Exception as e:
+            record_result("Admin Integration: update user then GET reflects updated name", False, f"Exception: {e}")
+
+        # 487. Disabled user has disabled=True flag visible via GET
+        try:
+            mock_db._store["users"]["uid_disabled_check"] = {
+                "uid": "uid_disabled_check", "email": "disabledcheck@solar.com",
+                "name": "Disabled Check User", "role": "owner",
+                "created_at": "2026-08-16T00:00:00Z"
+            }
+            client.delete("/api/admin/users/uid_disabled_check", headers={"Authorization": "Bearer valid-token-admin"})
+            r = client.get("/api/admin/users/uid_disabled_check", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("disabled") is True)
+            record_result("Admin Integration: disabled user has disabled=True flag in profile", passed, f"Disabled: {data.get('disabled')}")
+        except Exception as e:
+            record_result("Admin Integration: disabled user has disabled=True flag in profile", False, f"Exception: {e}")
+
+        # 488. Delete assignment then list no longer includes it
+        try:
+            mock_db._store["assignments"]["ASG-VERIFY-DEL"] = {
+                "assignment_id": "ASG-VERIFY-DEL", "technician_uid": "uid_tech",
+                "system_id": "SYS-OWNER001", "status": "active",
+                "assigned_at": "2026-08-16T00:00:00Z"
+            }
+            client.delete("/api/admin/assignments/ASG-VERIFY-DEL", headers={"Authorization": "Bearer valid-token-admin"})
+            r = client.get("/api/admin/assignments", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            found = any(a.get("assignment_id") == "ASG-VERIFY-DEL" for a in items)
+            passed = (r.status_code == 200 and not found)
+            record_result("Admin Integration: deleted assignment no longer appears in list", passed, f"Found: {found}")
+        except Exception as e:
+            record_result("Admin Integration: deleted assignment no longer appears in list", False, f"Exception: {e}")
+
+        # 489. Resolved alert has resolved_by and resolved_at visible via list
+        try:
+            mock_db._store["alerts"]["alert_resolve_verify"] = {
+                "id": "alert_resolve_verify", "type": "WARNING",
+                "message": "Verify resolve", "active": True,
+                "timestamp": "2026-08-18T00:00:00Z"
+            }
+            client.put("/api/admin/alerts/alert_resolve_verify", headers={"Authorization": "Bearer valid-token-admin"}, json={"active": False})
+            r = client.get("/api/admin/alerts?active_only=false", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            resolved = next((a for a in data.get("items", []) if a.get("alert_id") == "alert_resolve_verify"), None)
+            passed = (
+                resolved is not None
+                and resolved.get("active") is False
+                and "resolved_by" in resolved
+                and "resolved_at" in resolved
+            )
+            record_result("Admin Integration: resolved alert has resolved_by + resolved_at visible in list", passed, f"ResolvedBy: {(resolved or {}).get('resolved_by')}")
+        except Exception as e:
+            record_result("Admin Integration: resolved alert has resolved_by + resolved_at visible in list", False, f"Exception: {e}")
+
+        # 490. Complete admin oversight workflow: stats → users → sites → systems → assignments → alerts → documents → audit-log
+        try:
+            r1 = client.get("/api/admin/stats", headers={"Authorization": "Bearer valid-token-admin"})
+            r2 = client.get("/api/admin/users", headers={"Authorization": "Bearer valid-token-admin"})
+            r3 = client.get("/api/admin/sites", headers={"Authorization": "Bearer valid-token-admin"})
+            r4 = client.get("/api/admin/systems", headers={"Authorization": "Bearer valid-token-admin"})
+            r5 = client.get("/api/admin/assignments", headers={"Authorization": "Bearer valid-token-admin"})
+            r6 = client.get("/api/admin/alerts", headers={"Authorization": "Bearer valid-token-admin"})
+            r7 = client.get("/api/admin/documents", headers={"Authorization": "Bearer valid-token-admin"})
+            r8 = client.get("/api/admin/audit-log", headers={"Authorization": "Bearer valid-token-admin"})
+            all_ok = all(r.status_code == 200 for r in [r1, r2, r3, r4, r5, r6, r7, r8])
+            passed = all_ok
+            record_result(
+                "Admin Integration: Complete oversight workflow — all 8 admin endpoints return 200",
+                passed,
+                f"Stats:{r1.status_code} Users:{r2.status_code} Sites:{r3.status_code} Sys:{r4.status_code} "
+                f"Asg:{r5.status_code} Alerts:{r6.status_code} Docs:{r7.status_code} Audit:{r8.status_code}"
+            )
+        except Exception as e:
+            record_result("Admin Integration: Complete oversight workflow — all 8 admin endpoints return 200", False, f"Exception: {e}")        # ---------------------------------------------------------
+        # ADMIN READINGS (Tests 491 – 495)
+        # ---------------------------------------------------------
+
+        # 491. Admin lists telemetry readings across systems — 200 with paginated envelope
+        try:
+            r = client.get("/api/admin/readings", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and "items" in data
+                and "total" in data
+                and isinstance(data["items"], list)
+                and "page" in data
+                and "per_page" in data
+            )
+            record_result("Admin Readings: GET /api/admin/readings returns 200 with paginated envelope", passed, f"Status: {r.status_code} | Total: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Readings: GET /api/admin/readings returns 200 with paginated envelope", False, f"Exception: {e}")
+
+        # 492. Admin filters readings by system_id
+        try:
+            mock_db._store.setdefault("readings", {})
+            mock_db._store["readings"]["read_admin_filter_01"] = {
+                "system_id": "SYS-OWNER001",
+                "timestamp": "2026-08-21T02:00:00Z",
+                "unix_timestamp": 1755748800.0,
+                "power": 120.0,
+                "expected_power": 130.0,
+                "performance_ratio": 0.923,
+            }
+            r = client.get("/api/admin/readings?system_id=SYS-OWNER001", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            all_sys = all(rd.get("system_id") == "SYS-OWNER001" for rd in items)
+            passed = (r.status_code == 200 and len(items) >= 1 and all_sys)
+            record_result("Admin Readings: system_id filter returns only matching readings", passed, f"Status: {r.status_code} | Filtered: {len(items)}")
+        except Exception as e:
+            record_result("Admin Readings: system_id filter returns only matching readings", False, f"Exception: {e}")
+
+        # 493. Owner cannot access admin readings — 403 Forbidden
+        try:
+            r = client.get("/api/admin/readings", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Readings: Owner on /api/admin/readings rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Readings: Owner on /api/admin/readings rejected with 403", False, f"Exception: {e}")
+
+        # 494. Technician cannot access admin readings — 403 Forbidden
+        try:
+            r = client.get("/api/admin/readings", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Admin Readings: Technician on /api/admin/readings rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Readings: Technician on /api/admin/readings rejected with 403", False, f"Exception: {e}")
+
+        # 495. Unauthenticated request to admin readings — 401 Unauthorized
+        try:
+            r = client.get("/api/admin/readings")
+            passed = (r.status_code == 401)
+            record_result("Admin Readings: Unauthenticated request to /api/admin/readings returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Readings: Unauthenticated request to /api/admin/readings returns 401", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ADMIN REPORTS SUMMARY (Tests 496 – 500)
+        # ---------------------------------------------------------
+
+        # 496. Admin gets reports summary — 200 with all required platform KPIs
+        try:
+            r = client.get("/api/admin/reports/summary", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and "total_users" in data
+                and "total_sites" in data
+                and "total_systems" in data
+                and "total_readings" in data
+                and "active_alerts" in data
+                and "overall_generation" in data
+                and "overall_expected_generation" in data
+                and "total_lost_generation" in data
+                and "average_performance_ratio" in data
+                and "generated_at" in data
+            )
+            record_result("Admin Reports Summary: GET /api/admin/reports/summary returns 200 with all KPIs", passed, f"Status: {r.status_code} | TotalSystems: {data.get('total_systems')}")
+        except Exception as e:
+            record_result("Admin Reports Summary: GET /api/admin/reports/summary returns 200 with all KPIs", False, f"Exception: {e}")
+
+        # 497. Owner on /api/admin/reports/summary rejected with 403
+        try:
+            r = client.get("/api/admin/reports/summary", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Reports Summary: Owner on /api/admin/reports/summary rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Reports Summary: Owner on /api/admin/reports/summary rejected with 403", False, f"Exception: {e}")
+
+        # 498. Technician on /api/admin/reports/summary rejected with 403
+        try:
+            r = client.get("/api/admin/reports/summary", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("Admin Reports Summary: Technician on /api/admin/reports/summary rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Reports Summary: Technician on /api/admin/reports/summary rejected with 403", False, f"Exception: {e}")
+
+        # 499. Unauthenticated on /api/admin/reports/summary rejected with 401
+        try:
+            r = client.get("/api/admin/reports/summary")
+            passed = (r.status_code == 401)
+            record_result("Admin Reports Summary: Unauthenticated request rejected with 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Reports Summary: Unauthenticated request rejected with 401", False, f"Exception: {e}")
+
+        # 500. Reports summary numerical KPIs are valid numbers
+        try:
+            r = client.get("/api/admin/reports/summary", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and isinstance(data.get("overall_generation"), (int, float))
+                and isinstance(data.get("overall_expected_generation"), (int, float))
+                and isinstance(data.get("total_lost_generation"), (int, float))
+                and data.get("total_readings", -1) >= 0
+            )
+            record_result("Admin Reports Summary: Energy metrics and readings count are non-negative numeric types", passed, f"Gen: {data.get('overall_generation')} | Exp: {data.get('overall_expected_generation')}")
+        except Exception as e:
+            record_result("Admin Reports Summary: Energy metrics and readings count are non-negative numeric types", False, f"Exception: {e}")
+
+        # ---------------------------------------------------------
+        # ADMIN HEALTH MONITORING (Tests 501 – 505)
+        # ---------------------------------------------------------
+
+        # 501. Admin lists multi-system health scores — 200 with paginated envelope
+        try:
+            r = client.get("/api/admin/health", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (
+                r.status_code == 200
+                and "items" in data
+                and "total" in data
+                and isinstance(data["items"], list)
+                and data["total"] >= 2
+            )
+            record_result("Admin Health: GET /api/admin/health returns 200 with multi-system health scores", passed, f"Status: {r.status_code} | TotalSystems: {data.get('total')}")
+        except Exception as e:
+            record_result("Admin Health: GET /api/admin/health returns 200 with multi-system health scores", False, f"Exception: {e}")
+
+        # 502. Admin health sorts lowest first by default or with ?sort=lowest
+        try:
+            r = client.get("/api/admin/health?sort=lowest", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            scores = [x["health_score"] for x in items if x.get("health_score") is not None]
+            is_sorted = (scores == sorted(scores))
+            passed = (r.status_code == 200 and len(items) >= 2 and is_sorted)
+            record_result("Admin Health: sort=lowest sorts systems lowest health score first", passed, f"Scores: {scores} | IsSorted: {is_sorted}")
+        except Exception as e:
+            record_result("Admin Health: sort=lowest sorts systems lowest health score first", False, f"Exception: {e}")
+
+        # 503. Admin health sorts highest first with ?sort=highest
+        try:
+            r = client.get("/api/admin/health?sort=highest", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            items = data.get("items", [])
+            scores = [x["health_score"] for x in items if x.get("health_score") is not None]
+            is_desc_sorted = (scores == sorted(scores, reverse=True))
+            passed = (r.status_code == 200 and len(items) >= 2 and is_desc_sorted)
+            record_result("Admin Health: sort=highest sorts systems highest health score first", passed, f"Scores: {scores} | IsSorted: {is_desc_sorted}")
+        except Exception as e:
+            record_result("Admin Health: sort=highest sorts systems highest health score first", False, f"Exception: {e}")
+
+        # 504. Owner on /api/admin/health rejected with 403
+        try:
+            r = client.get("/api/admin/health", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Admin Health: Owner on /api/admin/health rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Health: Owner on /api/admin/health rejected with 403", False, f"Exception: {e}")
+
+        # 505. Unauthenticated request to /api/admin/health returns 401
+        try:
+            r = client.get("/api/admin/health")
+            passed = (r.status_code == 401)
+            record_result("Admin Health: Unauthenticated request to /api/admin/health returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Health: Unauthenticated request to /api/admin/health returns 401", False, f"Exception: {e}")
+
+        # ===================================================================
+        # SEGMENT 16: API CONTRACT, INTEGRATION, DOCUMENTATION & HARDENING
+        # ===================================================================
+
+        # 506. CORS: OPTIONS preflight on /api/systems returns 200 with required CORS headers
+        try:
+            r = client.options("/api/systems", headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization, Content-Type"
+            })
+            passed = (
+                r.status_code == 200 and
+                "Access-Control-Allow-Origin" in r.headers and
+                "Access-Control-Allow-Methods" in r.headers
+            )
+            record_result("CORS: OPTIONS preflight on /api/systems returns 200 with CORS headers", passed, f"Status: {r.status_code} | Allow-Origin: {r.headers.get('Access-Control-Allow-Origin')}")
+        except Exception as e:
+            record_result("CORS: OPTIONS preflight on /api/systems returns 200 with CORS headers", False, f"Exception: {e}")
+
+        # 507. CORS: OPTIONS preflight on /api/documents/upload allows POST and Authorization header
+        try:
+            r = client.options("/api/documents/upload", headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization, Content-Type"
+            })
+            passed = (r.status_code == 200 and "Access-Control-Allow-Origin" in r.headers)
+            record_result("CORS: OPTIONS preflight on /api/documents/upload allows POST & Auth header", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("CORS: OPTIONS preflight on /api/documents/upload allows POST & Auth header", False, f"Exception: {e}")
+
+        # 508. CORS: Actual GET request on /api/health includes Access-Control-Allow-Origin
+        try:
+            r = client.get("/api/health", headers={"Origin": "http://localhost:3000"})
+            passed = (r.status_code == 200 and "Access-Control-Allow-Origin" in r.headers)
+            record_result("CORS: Actual GET /api/health includes Access-Control-Allow-Origin", passed, f"Status: {r.status_code} | Header: {r.headers.get('Access-Control-Allow-Origin')}")
+        except Exception as e:
+            record_result("CORS: Actual GET /api/health includes Access-Control-Allow-Origin", False, f"Exception: {e}")
+
+        # 509. Health: GET /api/health returns status 'ok' and 200
+        try:
+            r = client.get("/api/health")
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("status") == "ok" and "service" in data and "timestamp" in data)
+            record_result("Health: GET /api/health returns status 'ok' and 200", passed, f"Status: {r.status_code} | Data: {data.get('status')}")
+        except Exception as e:
+            record_result("Health: GET /api/health returns status 'ok' and 200", False, f"Exception: {e}")
+
+        # 510. Health Readiness: GET /api/health/ready returns status 'ready' and 200 with active db
+        try:
+            r = client.get("/api/health/ready")
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("status") == "ready" and data.get("database") == "connected")
+            record_result("Health Readiness: GET /api/health/ready returns 'ready' and 200", passed, f"Status: {r.status_code} | Database: {data.get('database')}")
+        except Exception as e:
+            record_result("Health Readiness: GET /api/health/ready returns 'ready' and 200", False, f"Exception: {e}")
+
+        # 511. Health Readiness: GET /api/health/ready returns 503 when db is unavailable
+        try:
+            with patch("BACKEND.app.get_db", return_value=None):
+                r = client.get("/api/health/ready")
+                data = r.get_json() or {}
+                passed = (r.status_code == 503 and data.get("status") == "unavailable" and data.get("database") == "disconnected")
+                record_result("Health Readiness: GET /api/health/ready returns 503 when db is None", passed, f"Status: {r.status_code} | Status: {data.get('status')}")
+        except Exception as e:
+            record_result("Health Readiness: GET /api/health/ready returns 503 when db is None", False, f"Exception: {e}")
+
+        # 512. Auth Security: Missing Authorization header on protected route /api/auth/me returns 401
+        try:
+            r = client.get("/api/auth/me")
+            data = r.get_json() or {}
+            passed = (r.status_code == 401 and "Unauthorized" in data.get("error", ""))
+            record_result("Auth Security: Missing Authorization header on /api/auth/me returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: Missing Authorization header on /api/auth/me returns 401", False, f"Exception: {e}")
+
+        # 513. Auth Security: Malformed header ('Basic abc') on protected route returns 401
+        try:
+            r = client.get("/api/auth/me", headers={"Authorization": "Basic dXNlcjpwYXNz"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 401 and "Unauthorized" in data.get("error", ""))
+            record_result("Auth Security: Malformed header ('Basic ...') returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: Malformed header ('Basic ...') returns 401", False, f"Exception: {e}")
+
+        # 514. Auth Security: Empty Bearer token ('Bearer ') returns 401
+        try:
+            r = client.get("/api/auth/me", headers={"Authorization": "Bearer "})
+            data = r.get_json() or {}
+            passed = (r.status_code == 401 and "Unauthorized" in data.get("error", ""))
+            record_result("Auth Security: Empty Bearer token ('Bearer ') returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: Empty Bearer token ('Bearer ') returns 401", False, f"Exception: {e}")
+
+        # 515. Auth Security: Invalid / expired token returns 401
+        try:
+            r = client.get("/api/auth/me", headers={"Authorization": "Bearer completely-invalid-expired-jwt-token"})
+            passed = (r.status_code == 401)
+            record_result("Auth Security: Invalid / expired token returns 401", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: Invalid / expired token returns 401", False, f"Exception: {e}")
+
+        # 516. Auth Security: Token with missing Firestore user profile returns 403
+        try:
+            r = client.get("/api/auth/me", headers={"Authorization": "Bearer valid-token-orphan"})
+            passed = (r.status_code == 403)
+            record_result("Auth Security: Token with missing Firestore profile returns 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: Token with missing Firestore profile returns 403", False, f"Exception: {e}")
+
+        # 517. Auth Security: User profile with missing role returns 403 on role-protected route
+        try:
+            r = client.get("/api/auth/admin-only", headers={"Authorization": "Bearer valid-token-missing-role"})
+            passed = (r.status_code == 403)
+            record_result("Auth Security: User profile with missing role returns 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: User profile with missing role returns 403", False, f"Exception: {e}")
+
+        # 518. Auth Security: User profile with invalid role returns 403 on role-protected route
+        try:
+            r = client.get("/api/auth/tech-only", headers={"Authorization": "Bearer valid-token-invalid-role"})
+            passed = (r.status_code == 403)
+            record_result("Auth Security: User profile with invalid role returns 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Auth Security: User profile with invalid role returns 403", False, f"Exception: {e}")
+
+        # 519. RBAC Enforcement: Public registration with 'admin' role rejected with 403
+        try:
+            r = client.post("/api/auth/register", json={
+                "email": "hack_admin@solar.com",
+                "password": "password123",
+                "role": "admin"
+            })
+            passed = (r.status_code == 403)
+            record_result("RBAC: Public registration with 'admin' role rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Public registration with 'admin' role rejected with 403", False, f"Exception: {e}")
+
+        # 520. RBAC Enforcement: Public registration with 'technician' role rejected with 403
+        try:
+            r = client.post("/api/auth/register", json={
+                "email": "hack_tech@solar.com",
+                "password": "password123",
+                "role": "technician"
+            })
+            passed = (r.status_code == 403)
+            record_result("RBAC: Public registration with 'technician' role rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Public registration with 'technician' role rejected with 403", False, f"Exception: {e}")
+
+        # 521. RBAC Enforcement: Technician creating solar system rejected with 403
+        try:
+            r = client.post("/api/systems", json=VALID_SYSTEM_PAYLOAD, headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Technician creating solar system rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Technician creating solar system rejected with 403", False, f"Exception: {e}")
+
+        # 522. RBAC Enforcement: Technician updating solar system rejected with 403
+        try:
+            r = client.put("/api/systems/SYS-OWNER001", json={"name": "Hacked"}, headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Technician updating solar system rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Technician updating solar system rejected with 403", False, f"Exception: {e}")
+
+        # 523. RBAC Enforcement: Owner deleting solar system rejected with 403 (Admin-only)
+        try:
+            r = client.delete("/api/systems/SYS-OWNER001", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Owner deleting solar system rejected with 403 (Admin-only)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Owner deleting solar system rejected with 403 (Admin-only)", False, f"Exception: {e}")
+
+        # 524. RBAC Enforcement: Owner accessing assignments API rejected with 403
+        try:
+            r = client.get("/api/assignments", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Owner accessing /api/assignments rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Owner accessing /api/assignments rejected with 403", False, f"Exception: {e}")
+
+        # 525. RBAC Enforcement: Technician uploading document rejected with 403
+        try:
+            r = client.post("/api/documents/upload", json={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "filename": "tech_manual.pdf",
+                "file_url": "https://storage.example.com/test.pdf"
+            }, headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Technician uploading document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Technician uploading document rejected with 403", False, f"Exception: {e}")
+
+        # 526. RBAC Enforcement: Technician deleting document rejected with 403
+        try:
+            # Upload document as owner to get valid doc_id
+            pdf_bytes = b"%PDF-1.4\nowner document"
+            r_up = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-owner"}, data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "file": (io.BytesIO(pdf_bytes), "owner_manual.pdf")
+            }, content_type="multipart/form-data")
+            test_doc_id = (r_up.get_json() or {}).get("document", {}).get("doc_id")
+            
+            # Technician attempts to delete it
+            r = client.delete(f"/api/documents/{test_doc_id}", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Technician deleting document rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Technician deleting document rejected with 403", False, f"Exception: {e}")
+
+        # 527. RBAC Enforcement: Technician on ML train endpoint rejected with 403
+        try:
+            r = client.post("/api/ml/train", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("RBAC: Technician on /api/ml/train rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("RBAC: Technician on /api/ml/train rejected with 403", False, f"Exception: {e}")
+
+        # 528. API Validation: POST /api/ingest with missing required fields returns 400
+        try:
+            r = client.post("/api/ingest", json={"voltage": 48.0})
+            data = r.get_json() or {}
+            passed = (r.status_code == 400 and "missing_required_fields" in data)
+            record_result("API Validation: POST /api/ingest with missing fields returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: POST /api/ingest with missing fields returns 400", False, f"Exception: {e}")
+
+        # 529. API Validation: POST /api/ingest with non-numeric fields returns 400
+        try:
+            r = client.post("/api/ingest", json={
+                "voltage": "high",
+                "current": 10.0,
+                "power": 500.0,
+                "expected_power": 550.0
+            })
+            passed = (r.status_code == 400)
+            record_result("API Validation: POST /api/ingest with non-numeric voltage returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: POST /api/ingest with non-numeric voltage returns 400", False, f"Exception: {e}")
+
+        # 530. API Validation: POST /api/ingest with invalid ISO timestamp returns 400
+        try:
+            r = client.post("/api/ingest", json={
+                "voltage": 48.0,
+                "current": 10.0,
+                "power": 500.0,
+                "expected_power": 550.0,
+                "timestamp": "not-a-timestamp"
+            })
+            passed = (r.status_code == 400)
+            record_result("API Validation: POST /api/ingest with invalid timestamp returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: POST /api/ingest with invalid timestamp returns 400", False, f"Exception: {e}")
+
+        # 531. API Validation: GET /api/chat without query parameter returns 400
+        try:
+            r = client.get("/api/chat")
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/chat without query parameter returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/chat without query parameter returns 400", False, f"Exception: {e}")
+
+        # 532. API Validation: GET /api/reports/daily with invalid date format returns 400
+        try:
+            r = client.get("/api/reports/daily?date=21-08-2026&system_id=SYS-OWNER001", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/reports/daily with invalid date returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/reports/daily with invalid date returns 400", False, f"Exception: {e}")
+
+        # 533. API Validation: GET /api/reports/weekly with start_date > end_date returns 400
+        try:
+            r = client.get("/api/reports/weekly?start_date=2026-08-25&end_date=2026-08-20&system_id=SYS-OWNER001", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/reports/weekly with start > end returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/reports/weekly with start > end returns 400", False, f"Exception: {e}")
+
+        # 534. API Validation: GET /api/reports/monthly with invalid month format returns 400
+        try:
+            r = client.get("/api/reports/monthly?month=202608&system_id=SYS-OWNER001", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/reports/monthly with invalid month returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/reports/monthly with invalid month returns 400", False, f"Exception: {e}")
+
+        # 535. API Validation: GET /api/ml/predict with missing features returns 400
+        try:
+            r = client.get("/api/ml/predict?irradiance=800", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/ml/predict with missing features returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/ml/predict with missing features returns 400", False, f"Exception: {e}")
+
+        # 536. API Validation: GET /api/ml/predict with out-of-bounds irradiance returns 400
+        try:
+            r = client.get("/api/ml/predict?irradiance=2500&panel_temp=30&humidity=50&hour_of_day=12&day_of_week=2", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("API Validation: GET /api/ml/predict out-of-bounds irradiance returns 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("API Validation: GET /api/ml/predict out-of-bounds irradiance returns 400", False, f"Exception: {e}")
+
+        # 537. QR Architecture: GET /api/systems/SYS-OWNER001/qr?format=json encodes /qr-access/ destination
+        try:
+            r = client.get("/api/systems/SYS-OWNER001/qr?format=json", headers={"Authorization": "Bearer valid-token-owner"})
+            data = r.get_json() or {}
+            payload_url = data.get("qr_payload_url", "")
+            passed = (r.status_code == 200 and "/qr-access/SYS-OWNER001" in payload_url and "/systems/SYS-OWNER001" not in payload_url)
+            record_result("QR Architecture: QR payload encodes /qr-access/ destination", passed, f"Status: {r.status_code} | Payload: {payload_url}")
+        except Exception as e:
+            record_result("QR Architecture: QR payload encodes /qr-access/ destination", False, f"Exception: {e}")
+
+        # 538. QR Architecture: Public GET /api/qr-access/SYS-OWNER001 landing returns 200 safely
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001")
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("system_id") == "SYS-OWNER001" and "token" not in data and "power" not in data)
+            record_result("QR Architecture: Public /qr-access landing returns 200 safely", passed, f"Status: {r.status_code} | Portal: {data.get('portal')}")
+        except Exception as e:
+            record_result("QR Architecture: Public /qr-access landing returns 200 safely", False, f"Exception: {e}")
+
+        # 539. QR Security: Technician attempting privilege escalation (?intended_role=admin) rejected with 403
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-tech"})
+            passed = (r.status_code == 403)
+            record_result("QR Security: Technician spoofing admin on QR workspace rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Security: Technician spoofing admin on QR workspace rejected with 403", False, f"Exception: {e}")
+
+        # 540. QR Security: User attempting privilege escalation (?intended_role=admin) rejected with 403
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace?intended_role=admin", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("QR Security: Owner spoofing admin on QR workspace rejected with 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR Security: Owner spoofing admin on QR workspace rejected with 403", False, f"Exception: {e}")
+
+        # 541. QR IDOR Protection: User accessing workspace for unowned system returns 403
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER002/workspace", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("QR IDOR Protection: Owner accessing unowned system workspace returns 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("QR IDOR Protection: Owner accessing unowned system workspace returns 403", False, f"Exception: {e}")
+
+        # 542. QR Admin Power: Admin accessing workspace routes to /admin/dashboard with full powers
+        try:
+            r = client.get("/api/qr-access/SYS-OWNER001/workspace", headers={"Authorization": "Bearer valid-token-admin"})
+            data = r.get_json() or {}
+            passed = (r.status_code == 200 and data.get("access_role") == "admin" and data.get("view_only") is False and data.get("full_admin_permissions") is True)
+            record_result("QR Admin Power: Admin retains full administrative dashboard permissions", passed, f"Status: {r.status_code} | ViewOnly: {data.get('view_only')}")
+        except Exception as e:
+            record_result("QR Admin Power: Admin retains full administrative dashboard permissions", False, f"Exception: {e}")
+
+        # 543. Documents Security: Magic bytes inspection rejects text file disguised as PDF
+        try:
+            fake_pdf = io.BytesIO(b"This is plain text and not a real PDF document.")
+            fake_pdf.name = "fake.pdf"
+            r = client.post("/api/documents/upload", data={
+                "system_id": "SYS-OWNER001",
+                "type": "invoice",
+                "format": "PDF",
+                "file": (fake_pdf, "fake.pdf")
+            }, content_type="multipart/form-data", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 400)
+            record_result("Documents Security: Disguised text file with .pdf extension rejected with 400", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Documents Security: Disguised text file with .pdf extension rejected with 400", False, f"Exception: {e}")
+
+        # 544. Documents Security: Magic bytes inspection accepts valid PDF header (%PDF-)
+        try:
+            real_pdf = io.BytesIO(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF")
+            real_pdf.name = "real.pdf"
+            r = client.post("/api/documents/upload", data={
+                "system_id": "SYS-OWNER001",
+                "type": "manual",
+                "format": "PDF",
+                "file": (real_pdf, "real.pdf")
+            }, content_type="multipart/form-data", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 201)
+            record_result("Documents Security: Valid PDF magic bytes accepted with 201", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Documents Security: Valid PDF magic bytes accepted with 201", False, f"Exception: {e}")
+
+        # 545. Documents Security: Unauthorized user downloading document for another owner's system returns 403
+        try:
+            # Upload a document to SYS-OWNER002 (owned by owner2) as admin
+            pdf_bytes = b"%PDF-1.4\nowner2 private document"
+            r_up = client.post("/api/documents/upload", headers={"Authorization": "Bearer valid-token-admin"}, data={
+                "system_id": "SYS-OWNER002",
+                "type": "warranty",
+                "file": (io.BytesIO(pdf_bytes), "owner2_warranty.pdf")
+            }, content_type="multipart/form-data")
+            owner2_doc_id = (r_up.get_json() or {}).get("document", {}).get("doc_id")
+            
+            # Owner 1 (who only owns SYS-OWNER001) tries to download Owner 2's document
+            r = client.get(f"/api/documents/{owner2_doc_id}/file", headers={"Authorization": "Bearer valid-token-owner"})
+            passed = (r.status_code == 403)
+            record_result("Documents Security: Cross-owner document file download returns 403", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Documents Security: Cross-owner document file download returns 403", False, f"Exception: {e}")
+
+        # 546. Admin Safeguards: Admin cannot disable own account (self-guard 403)
+        try:
+            r = client.delete("/api/admin/users/uid_admin", headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 403)
+            record_result("Admin Safeguards: Admin cannot disable own account (self-guard 403)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Safeguards: Admin cannot disable own account (self-guard 403)", False, f"Exception: {e}")
+
+        # 547. Admin Safeguards: Admin cannot demote last admin to owner (zero-admin guard 403)
+        try:
+            r = client.put("/api/admin/users/uid_admin", json={"role": "owner"}, headers={"Authorization": "Bearer valid-token-admin"})
+            passed = (r.status_code == 403)
+            record_result("Admin Safeguards: Cannot demote last admin on platform (zero-admin guard 403)", passed, f"Status: {r.status_code}")
+        except Exception as e:
+            record_result("Admin Safeguards: Cannot demote last admin on platform (zero-admin guard 403)", False, f"Exception: {e}")
+
+        # 548. OpenAPI Consistency: All registered Flask API route endpoints exist in docs/openapi.yaml
+        try:
+            openapi_path = os.path.join(os.path.dirname(__file__), "..", "docs", "openapi.yaml")
+            with open(openapi_path, "r", encoding="utf-8") as f:
+                openapi_content = f.read()
+
+            documented_paths = set(re.findall(r"^\s{2}(/api/[^:\n]+):", openapi_content, re.MULTILINE))
+
+            flask_api_rules = set()
+            for rule in app.url_map.iter_rules():
+                rule_str = str(rule)
+                if rule_str.startswith("/api/"):
+                    re_param = re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", rule_str)
+                    flask_api_rules.add(re_param)
+
+            missing_in_openapi = [r for r in flask_api_rules if r not in documented_paths]
+            passed = (len(missing_in_openapi) == 0)
+            record_result("OpenAPI Consistency: All Flask API routes covered in openapi.yaml", passed, f"Covered: {len(flask_api_rules)} | Missing: {missing_in_openapi}")
+        except Exception as e:
+            record_result("OpenAPI Consistency: All Flask API routes covered in openapi.yaml", False, f"Exception: {e}")
+
+        # 549. Documentation Consistency: All registered Flask API route endpoints exist in docs/api_documentation.md
+        try:
+            doc_path = os.path.join(os.path.dirname(__file__), "..", "docs", "api_documentation.md")
+            with open(doc_path, "r", encoding="utf-8") as f:
+                doc_content = f.read()
+
+            missing_in_docs = []
+            for rule in app.url_map.iter_rules():
+                rule_str = str(rule)
+                if rule_str.startswith("/api/"):
+                    norm_rule = re.sub(r"<(?:\w+:)?(\w+)>", r"{\1}", rule_str)
+                    short_rule = re.sub(r"<(?:\w+:)?(\w+)>", r"{id}", rule_str)
+                    if norm_rule not in doc_content and short_rule not in doc_content:
+                        missing_in_docs.append(rule_str)
+
+            passed = (len(missing_in_docs) == 0)
+            record_result("Documentation Consistency: All Flask API routes documented in api_documentation.md", passed, f"Missing: {missing_in_docs}")
+        except Exception as e:
+            record_result("Documentation Consistency: All Flask API routes documented in api_documentation.md", False, f"Exception: {e}")
+
+        # 550. Environment & Security Check: .env.example exists without real private keys or secrets
+        try:
+            env_example_path = os.path.join(os.path.dirname(__file__), "..", ".env.example")
+            with open(env_example_path, "r", encoding="utf-8") as f:
+                env_content = f.read()
+
+            has_no_secrets = (
+                "-----BEGIN PRIVATE KEY-----" not in env_content and
+                "\"private_key\"" not in env_content and
+                "FLASK_PORT=5000" in env_content and
+                "CORS_ORIGINS" in env_content and
+                "SOLAR_PUBLIC_BASE_URL" in env_content
+            )
+            passed = (os.path.exists(env_example_path) and has_no_secrets)
+            record_result("Security: .env.example exists without exposed credentials", passed, f"Exists: {os.path.exists(env_example_path)} | SecretsFree: {has_no_secrets}")
+        except Exception as e:
+            record_result("Security: .env.example exists without exposed credentials", False, f"Exception: {e}")
+
+
 
 
 

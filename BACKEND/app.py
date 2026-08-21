@@ -27,6 +27,8 @@ from BACKEND.systems import systems_bp
 from BACKEND.assignments import assignments_bp
 from BACKEND.reports import reports_bp
 from BACKEND.ml_predict import ml_bp
+from BACKEND.documents import documents_bp
+from BACKEND.admin_panel import admin_bp
 
 # Configure backend logging
 logging.basicConfig(
@@ -36,8 +38,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# Enable CORS for all routes (enables future React/Vue/Angular frontend integration)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ---------------------------------------------------------------------------
+# CORS Configuration (Segment 16)
+# ---------------------------------------------------------------------------
+# In Development:
+#   CORS_ORIGINS=* (allows all origins, suitable for local frontend dev servers)
+# In Production:
+#   CORS_ORIGINS=https://solar-dashboard.example.com,https://admin.solar.example.com
+#   Specify explicit trusted origins in environment variables or .env file.
+raw_cors_origins = os.environ.get("CORS_ORIGINS", "*").strip()
+if raw_cors_origins == "*":
+    cors_origins_config = "*"
+else:
+    cors_origins_config = [orig.strip() for orig in raw_cors_origins.split(",") if orig.strip()]
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": cors_origins_config}},
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 # Register Authentication Blueprint
 app.register_blueprint(auth_bp)
@@ -57,6 +78,12 @@ app.register_blueprint(reports_bp)
 # Register Machine Learning & Health Score Blueprint (Segment 13)
 app.register_blueprint(ml_bp)
 
+# Register Document & QR Code Management Blueprint (Segment 14)
+app.register_blueprint(documents_bp)
+
+# Register Admin Panel Blueprint (Segment 15)
+app.register_blueprint(admin_bp)
+
 COLLECTION_READINGS = "readings"
 COLLECTION_ALERTS = "alerts"
 
@@ -64,15 +91,49 @@ COLLECTION_ALERTS = "alerts"
 @app.route("/api/health", methods=["GET"])
 def health_check():
     """
-    Health check endpoint.
+    Liveness health check endpoint.
     Returns:
-        JSON response with system status and server UTC timestamp.
+        JSON response with system liveness status and server UTC timestamp.
     """
     return jsonify({
         "status": "ok",
         "service": "Solar Monitoring Backend API",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
+
+
+@app.route("/api/health/ready", methods=["GET"])
+def readiness_check():
+    """
+    Readiness health check endpoint verifying database connectivity.
+    Returns:
+        JSON response with database connection state and status 200 (or 503 if unavailable).
+    """
+    try:
+        db = get_db()
+        if db is None:
+            return jsonify({
+                "status": "unavailable",
+                "service": "Solar Monitoring Backend API",
+                "database": "disconnected",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }), 503
+
+        return jsonify({
+            "status": "ready",
+            "service": "Solar Monitoring Backend API",
+            "database": "connected",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        return jsonify({
+            "status": "error",
+            "service": "Solar Monitoring Backend API",
+            "database": "error",
+            "message": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), 503
 
 
 @app.route("/api/readings/latest", methods=["GET"])

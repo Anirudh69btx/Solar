@@ -234,17 +234,17 @@ def prepare_features_from_readings(
             df["power"] = df["actual_power"]
 
     # 6. Derive hour_of_day and day_of_week from timestamps (UTC)
-    if "hour_of_day" not in df.columns or "day_of_week" not in df.columns:
-        dts = None
-        if "unix_timestamp" in df.columns and df["unix_timestamp"].notna().any():
-            dts = pd.to_datetime(df["unix_timestamp"], unit="s", utc=True, errors="coerce")
-        elif "timestamp" in df.columns and df["timestamp"].notna().any():
-            dts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        if dts is not None:
-            if "hour_of_day" not in df.columns:
-                df["hour_of_day"] = dts.dt.hour
-            if "day_of_week" not in df.columns:
-                df["day_of_week"] = dts.dt.dayofweek
+    dts_series = None
+    if "unix_timestamp" in df.columns and df["unix_timestamp"].notna().any():
+        dts_series = pd.to_datetime(df["unix_timestamp"], unit="s", utc=True, errors="coerce")
+    elif "timestamp" in df.columns and df["timestamp"].notna().any():
+        dts_series = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+    if dts_series is not None:
+        if "hour_of_day" not in df.columns:
+            df["hour_of_day"] = dts_series.dt.hour
+        if "day_of_week" not in df.columns:
+            df["day_of_week"] = dts_series.dt.dayofweek
 
     # 7. Check required features and target exist
     for col in FEATURE_NAMES:
@@ -266,6 +266,9 @@ def prepare_features_from_readings(
         capacity_safe                  = capacity_series.apply(lambda c: c if (c is not None and c > 0) else 1.0)
         clean_df["system_capacity_kw"] = capacity_safe
 
+        if dts_series is not None:
+            clean_df["_timestamp"] = dts_series
+
         if "power" in df.columns:
             raw_power = pd.to_numeric(df["power"], errors="coerce")
             clean_df["power"] = raw_power
@@ -278,8 +281,8 @@ def prepare_features_from_readings(
         return pd.DataFrame(columns=FEATURE_NAMES + [TARGET_NAME])
 
     # 9. Drop NaN and +-Inf
-    clean_df = clean_df.dropna()
-    clean_df = clean_df.replace([np.inf, -np.inf], np.nan).dropna()
+    clean_df = clean_df.dropna(subset=FEATURE_NAMES + [TARGET_NAME])
+    clean_df = clean_df.replace([np.inf, -np.inf], np.nan).dropna(subset=FEATURE_NAMES + [TARGET_NAME])
 
     # 10. Physical boundary filtering
     valid_mask = (
@@ -296,7 +299,11 @@ def prepare_features_from_readings(
     clean_df["hour_of_day"] = clean_df["hour_of_day"].astype(int)
     clean_df["day_of_week"] = clean_df["day_of_week"].astype(int)
 
-    # 12. Deduplicate
+    # 12. Chronological sort if timestamp available
+    if "_timestamp" in clean_df.columns and clean_df["_timestamp"].notna().any():
+        clean_df = clean_df.sort_values("_timestamp").reset_index(drop=True)
+
+    # 13. Deduplicate
     subset_cols = [c for c in FEATURE_NAMES + [TARGET_NAME] if c in clean_df.columns]
     clean_df = clean_df.drop_duplicates(
         subset=subset_cols
@@ -365,7 +372,7 @@ def generate_synthetic_training_data(n_samples: int = 300) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Model Training & Atomic Persistence
 # ---------------------------------------------------------------------------
-def train_model(db=None) -> Dict[str, Any]:
+def train_model(db=None, limit: int = 10000) -> Dict[str, Any]:
     """
     Fetch telemetry, clean data, train capacity-normalized LinearRegression model, evaluate metrics,
     and ATOMICALLY persist the bundle to model.pkl.
@@ -377,18 +384,27 @@ def train_model(db=None) -> Dict[str, Any]:
     training_source     = "firestore"
     raw_readings: List[Dict[str, Any]] = []
 
-    # 1. Fetch up to 1000 recent readings from Firestore
+    # 1. Fetch recent readings from Firestore (supporting unix_timestamp or timestamp)
     if db is not None:
         try:
             docs = list(
                 db.collection(COLLECTION_READINGS)
                 .order_by("unix_timestamp", direction="ASCENDING")
-                .limit(1000)
+                .limit(limit)
                 .stream()
             )
             raw_readings = [d.to_dict() for d in docs if d.to_dict()]
-        except Exception as exc:
-            logger.warning(f"train_model: Firestore query failed ({exc}). Using synthetic fallback.")
+        except Exception:
+            try:
+                docs = list(
+                    db.collection(COLLECTION_READINGS)
+                    .order_by("timestamp", direction="ASCENDING")
+                    .limit(limit)
+                    .stream()
+                )
+                raw_readings = [d.to_dict() for d in docs if d.to_dict()]
+            except Exception as exc:
+                logger.warning(f"train_model: Firestore query failed ({exc}). Using synthetic fallback.")
 
     # 2. Clean and validate
     df = prepare_features_from_readings(raw_readings)
@@ -415,34 +431,85 @@ def train_model(db=None) -> Dict[str, Any]:
     if len(X_test) == 0:
         X_test, y_test = X_train, y_train
 
+    # Extract temporal coverage for train/test splits if timestamps exist
+    training_start = None
+    training_end = None
+    test_start = None
+    test_end = None
+    if "_timestamp" in df.columns and df["_timestamp"].notna().any():
+        try:
+            train_ts = df.iloc[:split_idx]["_timestamp"].dropna()
+            test_ts = df.iloc[split_idx:]["_timestamp"].dropna()
+            if len(train_ts) > 0:
+                training_start = train_ts.min().isoformat()
+                training_end = train_ts.max().isoformat()
+            if len(test_ts) > 0:
+                test_start = test_ts.min().isoformat()
+                test_end = test_ts.max().isoformat()
+        except Exception as ts_exc:
+            logger.debug(f"train_model: Timestamp extraction note: {ts_exc}")
+
     # 6. Fit
     model = LinearRegression()
     model.fit(X_train, y_train)
 
     # 7. Evaluate
     y_pred = model.predict(X_test)
-    mae  = float(mean_absolute_error(y_test, y_pred))
-    rmse = float(np.sqrt(float(mean_squared_error(y_test, y_pred))))
-    r2   = float(r2_score(y_test, y_pred))
+    y_pred_clamped = np.maximum(0.0, y_pred)
+    mae  = float(mean_absolute_error(y_test, y_pred_clamped))
+    rmse = float(np.sqrt(float(mean_squared_error(y_test, y_pred_clamped))))
+    r2   = float(r2_score(y_test, y_pred_clamped))
+
+    # Evaluate daytime-only metrics (irradiance > 10 W/m²) on unseen test split
+    daytime_mask = (X_test["irradiance"] > 10.0)
+    daytime_samples = int(daytime_mask.sum())
+    if daytime_samples > 0:
+        X_test_day = X_test[daytime_mask]
+        y_test_day = y_test[daytime_mask]
+        y_pred_day = np.maximum(0.0, model.predict(X_test_day))
+        daytime_mae = float(mean_absolute_error(y_test_day, y_pred_day))
+        daytime_rmse = float(np.sqrt(float(mean_squared_error(y_test_day, y_pred_day))))
+        daytime_r2 = float(r2_score(y_test_day, y_pred_day))
+    else:
+        daytime_mae = None
+        daytime_rmse = None
+        daytime_r2 = None
+
+    irradiance_source = "real_telemetry" if not synthetic_data_used else "synthetic"
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     # 8. Metadata
     metadata: Dict[str, Any] = {
-        "model_type":            "LinearRegression",
-        "model_version":         MODEL_VERSION,
-        "feature_names":         list(FEATURE_NAMES),
-        "target_name":           TARGET_NAME,
-        "target_unit":           "Watts/kW",
-        "trained_at":            datetime.now(timezone.utc).isoformat(),
-        "training_sample_count": int(len(df)),
-        "train_set_size":        int(len(X_train)),
-        "test_set_size":         int(len(X_test)),
-        "synthetic_data_used":   synthetic_data_used,
-        "training_source":       training_source,
-        "split_strategy":        "chronological_80_20",
-        "split_note":            "Chronological split (first 80% train, last 20% test) to prevent temporal leakage.",
-        "mae":      round(mae, 4),
-        "rmse":     round(rmse, 4),
-        "r2_score": round(r2, 4),
+        "model_type":             "LinearRegression",
+        "model_version":          MODEL_VERSION,
+        "feature_names":          list(FEATURE_NAMES),
+        "target_name":            TARGET_NAME,
+        "target_unit":            "Watts/kW",
+        "trained_at":             now_iso,
+        "training_timestamp":     now_iso,
+        "training_sample_count":  int(len(df)),
+        "training_samples":       int(len(df)),
+        "train_set_size":         int(len(X_train)),
+        "test_set_size":          int(len(X_test)),
+        "test_samples":           int(len(X_test)),
+        "synthetic_data_used":    synthetic_data_used,
+        "training_source":        training_source,
+        "split_strategy":         "chronological_80_20",
+        "split_note":             "Chronological split (first 80% train, last 20% test) to prevent temporal leakage.",
+        "training_start":         training_start,
+        "training_end":           training_end,
+        "test_start":             test_start,
+        "test_end":               test_end,
+        "capacity_normalization": True,
+        "irradiance_source":      irradiance_source,
+        "mae":                    round(mae, 4),
+        "rmse":                   round(rmse, 4),
+        "r2":                     round(r2, 4),
+        "r2_score":               round(r2, 4),
+        "daytime_samples":        daytime_samples,
+        "daytime_mae":            round(daytime_mae, 4) if daytime_mae is not None else None,
+        "daytime_rmse":           round(daytime_rmse, 4) if daytime_rmse is not None else None,
+        "daytime_r2":             round(daytime_r2, 4) if daytime_r2 is not None else None,
     }
 
     bundle = {"model": model, "metadata": metadata}
@@ -587,13 +654,27 @@ def predict_power(features_dict: Dict[str, Any]) -> Dict[str, Any]:
         "model_type":                 metadata.get("model_type", "LinearRegression"),
         "model_version":              metadata.get("model_version", MODEL_VERSION),
         "trained_at":                 metadata.get("trained_at"),
+        "training_timestamp":         metadata.get("training_timestamp", metadata.get("trained_at")),
         "training_sample_count":      metadata.get("training_sample_count"),
-        "training_samples":           metadata.get("training_sample_count"),
+        "training_samples":           metadata.get("training_samples", metadata.get("training_sample_count")),
+        "test_samples":               metadata.get("test_samples", metadata.get("test_set_size")),
+        "test_set_size":              metadata.get("test_set_size"),
         "synthetic_data_used":        metadata.get("synthetic_data_used", False),
         "training_source":            metadata.get("training_source", "unknown"),
         "split_strategy":             metadata.get("split_strategy", "chronological_80_20"),
+        "training_start":             metadata.get("training_start"),
+        "training_end":               metadata.get("training_end"),
+        "test_start":                 metadata.get("test_start"),
+        "test_end":                   metadata.get("test_end"),
+        "capacity_normalization":     metadata.get("capacity_normalization", True),
+        "irradiance_source":          metadata.get("irradiance_source", "real_telemetry"),
+        "r2":                         metadata.get("r2", metadata.get("r2_score")),
         "r2_score":                   metadata.get("r2_score"),
         "mae":                        metadata.get("mae"),
+        "rmse":                       metadata.get("rmse"),
+        "daytime_mae":                metadata.get("daytime_mae"),
+        "daytime_rmse":               metadata.get("daytime_rmse"),
+        "daytime_r2":                 metadata.get("daytime_r2"),
         "features": {
             "irradiance":         irradiance,
             "panel_temp":         panel_temp,
@@ -672,7 +753,7 @@ def calculate_health_score(system_id: str, db=None) -> Dict[str, Any]:
     if db is None:
         return _health_no_data_response(system_id, message="Database connection unavailable")
 
-    # Query up to latest 100 readings for this system_id
+    # Query up to latest 100 readings for this system_id (supporting unix_timestamp or timestamp)
     docs = []
     try:
         query = (
@@ -687,13 +768,32 @@ def calculate_health_score(system_id: str, db=None) -> Dict[str, Any]:
             query = (
                 db.collection(COLLECTION_READINGS)
                 .where(filter=FieldFilter("system_id", "==", system_id))
+                .order_by("timestamp", direction="DESCENDING")
                 .limit(100)
             )
             docs = list(query.stream())
-            docs.sort(key=lambda d: d.to_dict().get("unix_timestamp", 0), reverse=True)
-        except Exception as exc:
-            logger.warning(f"calculate_health_score: query error for {system_id}: {exc}")
-            docs = []
+        except Exception:
+            try:
+                query = (
+                    db.collection(COLLECTION_READINGS)
+                    .where(filter=FieldFilter("system_id", "==", system_id))
+                    .limit(100)
+                )
+                docs = list(query.stream())
+                def _get_ts(d):
+                    dct = d.to_dict() or {}
+                    if "unix_timestamp" in dct and dct["unix_timestamp"] is not None:
+                        return float(dct["unix_timestamp"])
+                    if "timestamp" in dct and dct["timestamp"] is not None:
+                        try:
+                            return pd.to_datetime(dct["timestamp"], utc=True).timestamp()
+                        except Exception:
+                            return 0.0
+                    return 0.0
+                docs.sort(key=_get_ts, reverse=True)
+            except Exception as exc:
+                logger.warning(f"calculate_health_score: query error for {system_id}: {exc}")
+                docs = []
 
     if not docs:
         return _health_no_data_response(
